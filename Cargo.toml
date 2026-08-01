@@ -34,7 +34,6 @@ mipidsi = "0.9.0"
 embedded-3dgfx = { version = "0.4.1", default-features = false, features = ["row_width_320", "depth-u16", "physics"] }
 nalgebra = { version = "0.34", default-features = false, features = ["libm"] }
 libm = "0.2.11"
-ft6x06-rs = "0.3.0"
 
 [build-dependencies]
 cortex-m-rt = "0.7.5"

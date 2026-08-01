@@ -1,6 +1,8 @@
 #![no_std]
 #![no_main]
 
+mod ft6236;
+
 use core::cell::UnsafeCell;
 use core::fmt::Write;
 
