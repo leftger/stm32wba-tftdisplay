@@ -35,6 +35,21 @@ bind_interrupts!(struct Irqs {
     GPDMA1_CHANNEL1 => InterruptHandler<peripherals::GPDMA1_CH1>;
 });
 
+// Zero-overhead CS delay — embassy_time::Delay rounds to ~1ms per tick which
+// adds ~38ms waste for 38 tx_buffer flushes. NoDelay relies on SPI peripheral
+// hardware timing which is already in the nanosecond range.
+struct NoDelay;
+impl embedded_hal::delay::DelayNs for NoDelay {
+    fn delay_ns(&mut self, _ns: u32) {}
+}
+
+// 32KB static TX buffer — keeps SPI DMA chunking to 5 transactions instead
+// of 38 (which caused ~38ms of embassy_time overhead per frame).
+struct TxBuf([u8; 32768]);
+struct SafeTxBuf(UnsafeCell<TxBuf>);
+unsafe impl Sync for SafeTxBuf {}
+static RAW_TX_BUF: SafeTxBuf = SafeTxBuf(UnsafeCell::new(TxBuf([0u8; 32768])));
+
 const VIEW_WIDTH: usize = 240;
 const VIEW_HEIGHT: usize = 320;
 const VIEW3D_HEIGHT: usize = 256;
@@ -44,7 +59,6 @@ struct FrameBuffer([Rgb565; VIEW_PIXELS]);
 struct SafeFrameBuf(UnsafeCell<FrameBuffer>);
 unsafe impl Sync for SafeFrameBuf {}
 static RAW_FRAMEBUF: SafeFrameBuf = SafeFrameBuf(UnsafeCell::new(FrameBuffer([Rgb565::BLACK; VIEW_PIXELS])));
-
 // ----------------------------------------------------------------------------
 // DOOM E1M1-Inspired 16x16 Level Map
 // ----------------------------------------------------------------------------
@@ -177,9 +191,9 @@ async fn main(_spawner: Spawner) {
     let dc = Output::new(p.PB11, Level::Low, Speed::VeryHigh);
     let rst = Output::new(p.PA10, Level::High, Speed::VeryHigh);
 
-    let spi_device = ExclusiveDevice::new(spi, cs, embassy_time::Delay).unwrap();
-    let mut tx_buffer = [0u8; 4096];
-    let di = SpiInterface::new(spi_device, dc, &mut tx_buffer);
+    let tx_buf = unsafe { &mut (*RAW_TX_BUF.0.get()).0 };
+    let spi_device = ExclusiveDevice::new(spi, cs, NoDelay).unwrap();
+    let di = SpiInterface::new(spi_device, dc, tx_buf.as_mut_slice());
 
     let mut display = Builder::new(ILI9341Rgb565, di)
         .reset_pin(rst)
@@ -294,8 +308,8 @@ async fn main(_spawner: Spawner) {
         // --------------------------------------------------------------------
         // 2. DDA Raycaster Rendering Engine (320x192 Viewport)
         // --------------------------------------------------------------------
-        // Process columns 2 pixels wide for maximum throughput
-        for x in (0..VIEW_WIDTH).step_by(2) {
+        // Process columns 4 pixels wide — halves DDA ray count from 120 to 60
+        for x in (0..VIEW_WIDTH).step_by(4) {
             // Negate camera_x to compensate for display flip_horizontal() orientation
             let camera_x = -(2.0 * (x as f32) / (VIEW_WIDTH as f32) - 1.0);
             let ray_dir_x = dir_x + plane_x * camera_x;
@@ -349,39 +363,36 @@ async fn main(_spawner: Spawner) {
                 side_dist_y - delta_dist_y
             }.max(0.1);
 
-            z_buffer[x] = perp_wall_dist;
+            // Fill all 4 z-buffer slots for sprite occlusion
+            z_buffer[x]     = perp_wall_dist;
             z_buffer[x + 1] = perp_wall_dist;
+            z_buffer[x + 2] = perp_wall_dist;
+            z_buffer[x + 3] = perp_wall_dist;
 
             let line_height = (VIEW3D_HEIGHT as f32 / perp_wall_dist) as i32;
             let center_y = (VIEW3D_HEIGHT / 2) as i32 + head_bob;
 
             let draw_start = (center_y - line_height / 2).clamp(0, VIEW3D_HEIGHT as i32 - 1) as usize;
-            let draw_end = (center_y + line_height / 2).clamp(0, VIEW3D_HEIGHT as i32 - 1) as usize;
+            let draw_end   = (center_y + line_height / 2).clamp(0, VIEW3D_HEIGHT as i32 - 1) as usize;
 
-            let wall_color = get_wall_color(hit_wall, side);
+            let wall_color   = get_wall_color(hit_wall, side);
             let shade_factor = 1.0 / (1.0 + perp_wall_dist * 0.18);
-            let shaded_wall = apply_shade(wall_color, shade_factor);
+            let shaded_wall  = apply_shade(wall_color, shade_factor);
 
-            // Draw Ceiling, Wall Stripe, and Floor
             let ceiling_color = apply_shade(Rgb565::new(3, 6, 12), shade_factor * 0.5);
-            let floor_color = apply_shade(Rgb565::new(8, 6, 4), shade_factor * 0.6);
+            let floor_color   = apply_shade(Rgb565::new(8, 6, 4),  shade_factor * 0.6);
 
             for y in 0..draw_start {
                 let row = y * VIEW_WIDTH;
-                framebuf[row + x] = ceiling_color;
-                framebuf[row + x + 1] = ceiling_color;
+                framebuf[row + x..row + x + 4].fill(ceiling_color);
             }
-
             for y in draw_start..=draw_end {
                 let row = y * VIEW_WIDTH;
-                framebuf[row + x] = shaded_wall;
-                framebuf[row + x + 1] = shaded_wall;
+                framebuf[row + x..row + x + 4].fill(shaded_wall);
             }
-
             for y in (draw_end + 1)..VIEW3D_HEIGHT {
                 let row = y * VIEW_WIDTH;
-                framebuf[row + x] = floor_color;
-                framebuf[row + x + 1] = floor_color;
+                framebuf[row + x..row + x + 4].fill(floor_color);
             }
         }
 
@@ -523,29 +534,28 @@ async fn main(_spawner: Spawner) {
         }
 
         // D. Minimap — right side of HUD (x=186..234, y=HUD_Y+4..HUD_Y+52)
-        //    scale=3: each map tile = 3×3 px, 16 tiles × 3 = 48px in each axis
         const MINI_SCALE: usize = 3;
         let mini_x = 186usize;
         let mini_y = HUD_Y + 4;
 
-        // Background fill for minimap area
+        // Black background for minimap area
         for ry in mini_y..mini_y + 16 * MINI_SCALE {
             let row = ry * VIEW_WIDTH;
             framebuf[row + mini_x..row + mini_x + 16 * MINI_SCALE].fill(Rgb565::BLACK);
         }
-
-        // Draw wall tiles as filled MINI_SCALE×MINI_SCALE blocks
+        // Draw wall tiles — x mirrored to compensate for flip_horizontal() display
         for my in 0..16usize {
             for mx in 0..16usize {
                 let tile = MAP[my * 16 + mx];
                 if tile > 0 {
                     let tile_color = match tile {
-                        1 => Rgb565::new(14, 28, 14), // Grey walls
-                        2 => Rgb565::new(20, 4, 4),   // Red brick
-                        3 => Rgb565::new(3, 12, 22),  // Blue tech
-                        _ => Rgb565::new(16, 16, 8),  // Other
+                        1 => Rgb565::new(14, 28, 14),
+                        2 => Rgb565::new(20, 4, 4),
+                        3 => Rgb565::new(3, 12, 22),
+                        _ => Rgb565::new(16, 16, 8),
                     };
-                    let px = mini_x + mx * MINI_SCALE;
+                    // Reverse mx so that after hardware flip the map reads left→right
+                    let px = mini_x + (MAP_SIZE - 1 - mx) * MINI_SCALE;
                     let py = mini_y + my * MINI_SCALE;
                     for dy in 0..MINI_SCALE {
                         let row = (py + dy) * VIEW_WIDTH;
@@ -554,40 +564,40 @@ async fn main(_spawner: Spawner) {
                 }
             }
         }
-
-        // Player dot — 2×2 bright red
-        let player_px = mini_x + (pos_x * MINI_SCALE as f32) as usize;
-        let player_py = mini_y + (pos_y * MINI_SCALE as f32) as usize;
-        if player_py + 1 < mini_y + 16 * MINI_SCALE && player_px + 1 < mini_x + 16 * MINI_SCALE {
-            let pr = player_py * VIEW_WIDTH + player_px;
-            framebuf[pr]     = Rgb565::RED;
-            framebuf[pr + 1] = Rgb565::RED;
-            let pr2 = (player_py + 1) * VIEW_WIDTH + player_px;
-            framebuf[pr2]     = Rgb565::RED;
-            framebuf[pr2 + 1] = Rgb565::RED;
-        }
-
-        // Direction indicator — short line from player in facing direction
-        let dir_px = (player_px as i32 + (dir_x * 4.0) as i32).clamp(mini_x as i32, (mini_x + 16 * MINI_SCALE - 1) as i32) as usize;
-        let dir_py = (player_py as i32 + (dir_y * 4.0) as i32).clamp(mini_y as i32, (mini_y + 16 * MINI_SCALE - 1) as i32) as usize;
+        // Player dot (2×2) — mirror pos_x the same way
+        let player_px = (mini_x + ((MAP_SIZE as f32 - pos_x) * MINI_SCALE as f32) as usize)
+            .clamp(mini_x, mini_x + 16 * MINI_SCALE - 2);
+        let player_py = (mini_y + (pos_y * MINI_SCALE as f32) as usize)
+            .clamp(mini_y, mini_y + 16 * MINI_SCALE - 2);
+        let pr = player_py * VIEW_WIDTH + player_px;
+        framebuf[pr]     = Rgb565::RED;
+        framebuf[pr + 1] = Rgb565::RED;
+        let pr2 = (player_py + 1) * VIEW_WIDTH + player_px;
+        framebuf[pr2]     = Rgb565::RED;
+        framebuf[pr2 + 1] = Rgb565::RED;
+        // Direction arrow — negate dir_x contribution to match the mirrored x axis
+        let dir_px = (player_px as i32 - (dir_x * 4.0) as i32)
+            .clamp(mini_x as i32, (mini_x + 16 * MINI_SCALE - 1) as i32) as usize;
+        let dir_py = (player_py as i32 + (dir_y * 4.0) as i32)
+            .clamp(mini_y as i32, (mini_y + 16 * MINI_SCALE - 1) as i32) as usize;
         framebuf[dir_py * VIEW_WIDTH + dir_px] = Rgb565::YELLOW;
 
         last_raycast_us = raycast_start.elapsed().as_micros();
 
         // --------------------------------------------------------------------
-        // 6. High-Throughput Full Screen SPI DMA Frame Blit
+        // 6. Full-Screen SPI DMA Blit (NoDelay + 32KB tx_buffer = ~5 transactions)
         // --------------------------------------------------------------------
         let blit_start = Instant::now();
 
-        let full_screen_area = Rectangle::new(Point::new(0, 0), Size::new(VIEW_WIDTH as u32, VIEW_HEIGHT as u32)); // 240x320
-        let _ = display.fill_contiguous(&full_screen_area, framebuf.iter().copied());
+        let full_area = Rectangle::new(Point::new(0, 0), Size::new(VIEW_WIDTH as u32, VIEW_HEIGHT as u32));
+        let _ = display.fill_contiguous(&full_area, framebuf.iter().copied());
 
         last_blit_us = blit_start.elapsed().as_micros();
 
         last_total_ms = frame_start.elapsed().as_millis();
         frame_count += 1;
 
-        if frame_count % 30 == 0 {
+        if frame_count % 60 == 0 {
             defmt::info!("DOOM Demo Frame {}: Total {}ms (Raycast: {}us, DMA Blit: {}us, FPS: {})",
                 frame_count, last_total_ms, last_raycast_us, last_blit_us, 1000 / last_total_ms.max(1));
         }
