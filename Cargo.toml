@@ -3,6 +3,15 @@ name = "stm32wba-tftdisplay"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "stm32wba-tftdisplay"
+path = "src/main.rs"
+
+[[bin]]
+name = "doom_demo"
+path = "src/bin/doom_demo.rs"
+
+
 [dependencies]
 embassy-stm32 = { path = "../../embassy-project/embassy/embassy-stm32", features = ["stm32wba65ri", "memory-x", "time-driver-any"] }
 embassy-executor = { path = "../../embassy-project/embassy/embassy-executor", features = ["platform-cortex-m", "executor-thread", "defmt"] }
@@ -39,3 +48,4 @@ opt-level = 3
 debug = true
 lto = true
 codegen-units = 1
+panic = "abort"

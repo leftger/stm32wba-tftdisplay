@@ -40,22 +40,34 @@ The **DM-TFT28-116** TFT module (ILI9341 controller) connects to the NUCLEO-WBA6
 
 ---
 
+---
+
+## 🎮 Executable Demos
+
+### 1. 3D Physics & Wireframe Mesh Demo (`stm32wba-tftdisplay`)
+- Real-time 3D rigid-body physics, mesh rotations, color cycling, and HUD metrics running at ~85 FPS.
+- Flash & Run:
+  ```bash
+  cargo run --release --bin stm32wba-tftdisplay
+  ```
+
+### 2. DOOM E1M1-Inspired 3D Level Walkthrough Demo (`doom_demo`)
+- DDA Fast Raycasting 3D engine with 16x16 E1M1 map layout, wall height projection, distance lighting attenuation, depth-sorted 3D billboarded sprites (Barrels, Health Kits, Imp Enemies), animated DOOM Guy status avatar, radar minimap, and weapon recoil.
+- Flash & Run:
+  ```bash
+  cargo run --release --bin doom_demo
+  ```
+
+---
+
 ## 🚀 Building & Flashing
 
-### 1. Build Debug / Release Binaries
+### Build Release Binaries
 ```bash
-# Debug build
-cargo build
-
-# Optimized Release build
-cargo build --release
+cargo build --release --bins
 ```
 
-### 2. Run & Flash with Probe-rs
+### Flash with Probe-rs
 ```bash
-cargo run --release
-```
-or directly via `probe-rs`:
-```bash
-probe-rs run --chip STM32WBA65RI target/thumbv8m.main-none-eabihf/release/stm32wba-tftdisplay
+probe-rs run --chip STM32WBA65RI target/thumbv8m.main-none-eabihf/release/doom_demo
 ```

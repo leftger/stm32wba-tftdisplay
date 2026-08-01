@@ -12,6 +12,7 @@ use embassy_stm32::bind_interrupts;
 use embassy_stm32::dma::InterruptHandler;
 use embassy_stm32::gpio::{Level, Output, Speed};
 use embassy_stm32::peripherals;
+use embassy_stm32::rcc::*;
 use embassy_stm32::spi::{Config as SpiConfig, Spi};
 use embassy_stm32::time::Hertz;
 use embassy_stm32::Config;
@@ -22,7 +23,7 @@ use embedded_graphics::mono_font::{ascii::FONT_6X10, MonoTextStyle};
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::primitives::Rectangle;
 use embedded_graphics::prelude::*;
-use embedded_graphics::text::Text;
+use embedded_graphics::text::{Baseline, Text};
 
 use mipidsi::interface::SpiInterface;
 use mipidsi::models::ILI9341Rgb565;
@@ -59,7 +60,7 @@ unsafe impl Sync for SafeZBuf {}
 static RAW_ZBUF: SafeZBuf = SafeZBuf(UnsafeCell::new(ZBuffer([u16::MAX; VIEW_PIXELS])));
 
 // ----------------------------------------------------------------------------
-// Method A: Dirty Region Bounding Box Tracker
+// Dirty Region Bounding Box Tracker
 // ----------------------------------------------------------------------------
 
 #[derive(Clone, Copy)]
@@ -80,6 +81,12 @@ impl DirtyRect {
         }
     }
 
+    #[inline(always)]
+    fn is_valid(&self) -> bool {
+        self.min_x <= self.max_x && self.min_y <= self.max_y && self.min_x < VIEW_WIDTH && self.min_y < VIEW_HEIGHT
+    }
+
+    #[inline(always)]
     fn add_point(&mut self, x: usize, y: usize) {
         if x < self.min_x { self.min_x = x; }
         if y < self.min_y { self.min_y = y; }
@@ -87,6 +94,7 @@ impl DirtyRect {
         if y > self.max_y { self.max_y = y; }
     }
 
+    #[inline(always)]
     fn merge(&mut self, other: &DirtyRect) {
         if other.min_x < self.min_x { self.min_x = other.min_x; }
         if other.min_y < self.min_y { self.min_y = other.min_y; }
@@ -94,6 +102,7 @@ impl DirtyRect {
         if other.max_y > self.max_y { self.max_y = other.max_y; }
     }
 
+    #[inline(always)]
     fn sanitize(&mut self) {
         if self.min_x >= VIEW_WIDTH { self.min_x = VIEW_WIDTH - 1; }
         if self.min_y >= VIEW_HEIGHT { self.min_y = VIEW_HEIGHT - 1; }
@@ -147,12 +156,17 @@ impl<'a> DrawTarget for OffscreenBuffer<'a> {
         let x_end = (area.top_left.x + area.size.width as i32).min(VIEW_WIDTH as i32) as usize;
         let y_end = (area.top_left.y + area.size.height as i32).min(VIEW_HEIGHT as i32) as usize;
 
-        for y in y_start..y_end {
-            let row_offset = y * VIEW_WIDTH;
-            for x in x_start..x_end {
-                if let Some(color) = colors.next() {
-                    self.pixels[row_offset + x] = color;
-                    self.dirty.add_point(x, y);
+        if x_start < x_end && y_start < y_end {
+            self.dirty.add_point(x_start, y_start);
+            self.dirty.add_point(x_end - 1, y_end - 1);
+            for y in y_start..y_end {
+                let row_offset = y * VIEW_WIDTH;
+                for x in x_start..x_end {
+                    if let Some(color) = colors.next() {
+                        self.pixels[row_offset + x] = color;
+                    } else {
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -241,10 +255,27 @@ impl<const N: usize> Write for ArrayString<N> {
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
-    let p = embassy_stm32::init(Config::default());
+    // 1. High-Performance MCU Clock & APB Bus Configuration (100 MHz SYSCLK + 100 MHz APB1 for 50 MHz SPI)
+    let mut config = Config::default();
+    config.rcc.pll1 = Some(Pll {
+        source: PllSource::Hsi,
+        prediv: PllPreDiv::Div1,
+        mul: PllMul::Mul25,
+        divp: Some(PllDiv::Div25),
+        divq: None,
+        divr: Some(PllDiv::Div4), // 16MHz * 25 / 4 = 100 MHz System Clock
+        frac: Some(0),
+    });
+    config.rcc.sys = Sysclk::Pll1R;
+    config.rcc.ahb_pre = AHBPrescaler::Div1;
+    config.rcc.apb1_pre = APBPrescaler::Div1; // 100 MHz APB1 bus clock
+    config.rcc.apb2_pre = APBPrescaler::Div1;
+    config.rcc.voltage_scale = VoltageScale::Range1;
+    let p = embassy_stm32::init(config);
+
     defmt::info!("============================================");
     defmt::info!("STM32WBA65RI Full 320x240 Screen 3D Demo");
-    defmt::info!("Optimizations: Full Screen 320x240 Bounding Box + 50MHz SPI");
+    defmt::info!("Optimizations: Dual Mesh Tight Bounding Box SPI Blit");
     defmt::info!("============================================");
 
     let mut spi_config = SpiConfig::default();
@@ -276,14 +307,34 @@ async fn main(_spawner: Spawner) {
         .unwrap();
 
     // Initial background wipe once
-    display.clear(Rgb565::new(2, 3, 6)).unwrap();
+    let bg_color = Rgb565::new(2, 3, 6);
+    display.clear(bg_color).unwrap();
 
     let title_style = MonoTextStyle::new(&FONT_6X10, Rgb565::CYAN);
     let stats_style = MonoTextStyle::new(&FONT_6X10, Rgb565::GREEN);
 
+    let framebuf = unsafe { &mut (*RAW_FRAMEBUF.0.get()).0 };
+    let zbuf = unsafe { &mut (*RAW_ZBUF.0.get()).0 };
+
+    // Pre-render static HUD title banner ONCE onto display to keep 3D dirty rect isolated
+    framebuf.fill(bg_color);
+    {
+        let mut title_offscreen = OffscreenBuffer {
+            pixels: framebuf,
+            dirty: DirtyRect::empty(),
+        };
+        let _ = Text::with_baseline("STM32WBA65RI FULL 320x240 DEMO", Point::new(10, 5), title_style, Baseline::Top).draw(&mut title_offscreen);
+    }
+    let title_rect = Rectangle::new(Point::new(10, 5), Size::new(250, 15));
+    let title_pixels = (5..20).flat_map(|y| {
+        let row_off = y * VIEW_WIDTH;
+        &framebuf[row_off + 10..row_off + 260]
+    });
+    let _ = display.fill_contiguous(&title_rect, title_pixels.copied());
+
     let mut engine = K3dengine::new(VIEW_WIDTH as u16, VIEW_HEIGHT as u16);
     apply_default_caps(&mut engine);
-    engine.camera.set_position(Point3::new(0.0, 1.8, 5.0));
+    engine.camera.set_position(Point3::new(0.0, 1.8, 5.5));
     engine.camera.set_target(Point3::new(0.0, 0.0, 0.0));
 
     // Initialize 3D Physics World
@@ -291,7 +342,7 @@ async fn main(_spawner: Spawner) {
     physics_world.set_gravity(Vector3::new(0.0, -4.0, 0.0));
 
     let cube_body = RigidBody::new(1.0)
-        .with_position(Vector3::new(-1.3, 1.0, 0.0))
+        .with_position(Vector3::new(-1.1, 0.9, 0.0))
         .with_velocity(Vector3::new(0.0, 1.5, 0.0));
     let cube_id = physics_world.add_body(cube_body).unwrap();
 
@@ -323,20 +374,20 @@ async fn main(_spawner: Spawner) {
     octa_mesh.set_render_mode(RenderMode::Lines);
     octa_mesh.set_color(Rgb565::MAGENTA);
 
-    let framebuf = unsafe { &mut (*RAW_FRAMEBUF.0.get()).0 };
-    let zbuf = unsafe { &mut (*RAW_ZBUF.0.get()).0 };
     let mut commands = CommandBuffer::<512>::new();
 
     let mut angle: f32 = 0.0;
     let mut frame_count: u32 = 0;
     let mut palette_idx: usize = 0;
 
-    let mut prev_dirty = DirtyRect::empty();
+    let mut prev_cube_dirty = DirtyRect::empty();
+    let mut prev_octa_dirty = DirtyRect::empty();
+
     let mut last_render_us: u64 = 0;
     let mut last_blit_us: u64 = 0;
     let mut last_total_ms: u64 = 0;
 
-    let mut ticker = Ticker::every(Duration::from_millis(16)); // Target max FPS
+    let mut ticker = Ticker::every(Duration::from_millis(16)); // Target max 60 FPS
 
     loop {
         let frame_start = Instant::now();
@@ -345,8 +396,8 @@ async fn main(_spawner: Spawner) {
         physics_world.step::<4>(0.016);
         if let Some(body) = physics_world.body_mut(cube_id) {
             let pos = body.position;
-            if pos.y < -1.5 {
-                body.position = Vector3::new(-1.3, 1.5, 0.0);
+            if pos.y < -1.4 {
+                body.position = Vector3::new(-1.1, 1.4, 0.0);
                 body.velocity = Vector3::new(0.0, 2.5, 0.0);
             }
             cube_mesh.set_position(pos.x, pos.y, pos.z);
@@ -371,77 +422,127 @@ async fn main(_spawner: Spawner) {
 
         cube_mesh.set_attitude(angle * 0.8, angle, angle * 0.5);
 
-        octa_mesh.set_position(1.3, 0.0, 0.0);
+        octa_mesh.set_position(1.1, 0.0, 0.0);
         octa_mesh.set_attitude(-angle * 0.6, angle * 1.2, -angle * 0.4);
 
         let render_start = Instant::now();
 
-        // 2. Merge previous dirty rectangle to clear previous frame positions
-        let mut active_dirty = DirtyRect::empty();
-        active_dirty.merge(&prev_dirty);
+        // 2. Clear framebuf and zbuf ONLY in previous frame's mesh bounding boxes
+        let mut prev_combined = prev_cube_dirty;
+        prev_combined.merge(&prev_octa_dirty);
+        let clear_max_y = prev_combined.max_y.min(218);
 
-        // Clear framebuf and zbuf ONLY in dirty region
-        let bg_color = Rgb565::new(2, 3, 6);
-        if prev_dirty.min_x < VIEW_WIDTH && prev_dirty.min_y < VIEW_HEIGHT {
-            for y in prev_dirty.min_y..=prev_dirty.max_y {
+        if prev_combined.is_valid() && prev_combined.min_y <= clear_max_y {
+            for y in prev_combined.min_y..=clear_max_y {
                 let row_off = y * VIEW_WIDTH;
-                for x in prev_dirty.min_x..=prev_dirty.max_x {
-                    framebuf[row_off + x] = bg_color;
-                    zbuf[row_off + x] = u16::MAX;
-                }
+                framebuf[row_off + prev_combined.min_x..=row_off + prev_combined.max_x].fill(bg_color);
+                zbuf[row_off + prev_combined.min_x..=row_off + prev_combined.max_x].fill(u16::MAX);
             }
-        } else {
-            framebuf.fill(bg_color);
-            zbuf.fill(u16::MAX);
         }
 
-        let mut offscreen = OffscreenBuffer {
+        // 3. Render Cube Mesh into Offscreen Buffer
+        let mut cube_offscreen = OffscreenBuffer {
             pixels: framebuf,
-            dirty: active_dirty,
+            dirty: DirtyRect::empty(),
         };
-
-        // 3. Render Title & Stats Text directly inside off-screen RAM buffer across full 320x240
-        let _ = Text::new("STM32WBA65RI FULL 320x240 DEMO", Point::new(10, 15), title_style).draw(&mut offscreen);
-
-        let mut stats_str = ArrayString::<64>::new();
-        let fps = 1000 / last_total_ms.max(1);
-        let _ = write!(stats_str, "FPS:{} 3D:{}us DMA-Blit:{}us", fps, last_render_us, last_blit_us);
-        let _ = Text::new(stats_str.as_str(), Point::new(10, 225), stats_style).draw(&mut offscreen);
-
-        // 4. Render 3D Physics Meshes into 320x240 Offscreen Buffer
         commands.clear();
-        let meshes = [&cube_mesh, &octa_mesh];
-        if let Ok(()) = engine.record(meshes.into_iter(), &mut commands, None) {
+        if let Ok(()) = engine.record([&cube_mesh].into_iter(), &mut commands, None) {
             let mut frame = FrameCtx {
                 zbuffer: zbuf,
                 width: VIEW_WIDTH,
                 height: VIEW_HEIGHT,
             };
-            let _ = engine.execute::<_, 512>(&mut offscreen, &mut frame, &commands, None);
+            let _ = engine.execute::<_, 512>(&mut cube_offscreen, &mut frame, &commands, None);
         }
+        let mut cur_cube_dirty = cube_offscreen.dirty;
+        cur_cube_dirty.sanitize();
 
-        let mut dirty_region = offscreen.dirty;
-        dirty_region.sanitize();
-        prev_dirty = dirty_region;
+        // Render Octahedron Mesh into Offscreen Buffer
+        let mut octa_offscreen = OffscreenBuffer {
+            pixels: framebuf,
+            dirty: DirtyRect::empty(),
+        };
+        commands.clear();
+        if let Ok(()) = engine.record([&octa_mesh].into_iter(), &mut commands, None) {
+            let mut frame = FrameCtx {
+                zbuffer: zbuf,
+                width: VIEW_WIDTH,
+                height: VIEW_HEIGHT,
+            };
+            let _ = engine.execute::<_, 512>(&mut octa_offscreen, &mut frame, &commands, None);
+        }
+        let mut cur_octa_dirty = octa_offscreen.dirty;
+        cur_octa_dirty.sanitize();
+
+        // Prepare blit regions by merging current + previous bounds per mesh
+        let mut blit_cube = cur_cube_dirty;
+        blit_cube.merge(&prev_cube_dirty);
+        blit_cube.sanitize();
+        prev_cube_dirty = cur_cube_dirty;
+
+        let mut blit_octa = cur_octa_dirty;
+        blit_octa.merge(&prev_octa_dirty);
+        blit_octa.sanitize();
+        prev_octa_dirty = cur_octa_dirty;
+
+        // 4. Update HUD Stats text separately at bottom (y = 220..238)
+        let should_update_stats = frame_count % 10 == 0 || frame_count < 5;
+        if should_update_stats {
+            let mut stats_str = ArrayString::<64>::new();
+            let fps = 1000 / last_total_ms.max(1);
+            let _ = write!(stats_str, "FPS:{} 3D:{}us DMA:{}us", fps, last_render_us, last_blit_us);
+
+            for y in 220..238 {
+                let row_off = y * VIEW_WIDTH;
+                framebuf[row_off + 10..row_off + 240].fill(bg_color);
+            }
+            {
+                let mut stats_offscreen = OffscreenBuffer {
+                    pixels: framebuf,
+                    dirty: DirtyRect::empty(),
+                };
+                let _ = Text::with_baseline(stats_str.as_str(), Point::new(10, 224), stats_style, Baseline::Top).draw(&mut stats_offscreen);
+            }
+        }
 
         last_render_us = render_start.elapsed().as_micros();
 
-        // 5. Single-pass Blit of Full 320x240 3D Scene + Text over SPI DMA
+        // 5. Ultra-Fast Tight Bounding Box Blitting
         let blit_start = Instant::now();
-        let width = dirty_region.max_x - dirty_region.min_x + 1;
-        let height = dirty_region.max_y - dirty_region.min_y + 1;
 
-        let dirty_rect_area = Rectangle::new(
-            Point::new(dirty_region.min_x as i32, dirty_region.min_y as i32),
-            Size::new(width as u32, height as u32),
-        );
+        macro_rules! blit_dirty_rect {
+            ($rect:expr) => {
+                let max_y = $rect.max_y.min(218);
+                if $rect.is_valid() && $rect.min_y <= max_y {
+                    let width = $rect.max_x - $rect.min_x + 1;
+                    let height = max_y - $rect.min_y + 1;
+                    let area = Rectangle::new(
+                        Point::new($rect.min_x as i32, $rect.min_y as i32),
+                        Size::new(width as u32, height as u32),
+                    );
+                    let pixels = ($rect.min_y..=max_y).flat_map(|y| {
+                        let row_off = y * VIEW_WIDTH;
+                        &framebuf[row_off + $rect.min_x..=row_off + $rect.max_x]
+                    });
+                    let _ = display.fill_contiguous(&area, pixels.copied());
+                }
+            };
+        }
 
-        let dirty_pixels = (dirty_region.min_y..=dirty_region.max_y).flat_map(|y| {
-            let row_off = y * VIEW_WIDTH;
-            &framebuf[row_off + dirty_region.min_x..=row_off + dirty_region.max_x]
-        });
+        // Blit tight bounding boxes for Cube and Octahedron separately
+        blit_dirty_rect!(blit_cube);
+        blit_dirty_rect!(blit_octa);
 
-        let _ = display.fill_contiguous(&dirty_rect_area, dirty_pixels.copied());
+        // Blit stats text region (y = 220..238)
+        if should_update_stats {
+            let stats_rect_area = Rectangle::new(Point::new(10, 220), Size::new(230, 18));
+            let stats_pixels = (220..238).flat_map(|y| {
+                let row_off = y * VIEW_WIDTH;
+                &framebuf[row_off + 10..row_off + 240]
+            });
+            let _ = display.fill_contiguous(&stats_rect_area, stats_pixels.copied());
+        }
+
         last_blit_us = blit_start.elapsed().as_micros();
 
         last_total_ms = frame_start.elapsed().as_millis();
