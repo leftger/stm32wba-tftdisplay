@@ -116,13 +116,14 @@ struct Sprite {
     hit_flash: u8,   // Flash white on hit
 }
 
-static INITIAL_SPRITES: [Sprite; 8] = [
+static INITIAL_SPRITES: [Sprite; 9] = [
     Sprite { x: 3.5, y: 3.5, kind: 1, active: true, hp: 1, cooldown: 0, hit_flash: 0 },   // Barrel
     Sprite { x: 7.5, y: 4.0, kind: 2, active: true, hp: 1, cooldown: 0, hit_flash: 0 },   // Health Pack (+25 HP)
-    Sprite { x: 12.5, y: 4.5, kind: 3, active: true, hp: 2, cooldown: 40, hit_flash: 0 }, // Imp (2 HP)
+    Sprite { x: 2.5, y: 13.5, kind: 3, active: true, hp: 2, cooldown: 20, hit_flash: 0 }, // Imp 1 (Far South Corridor)
+    Sprite { x: 13.5, y: 12.5, kind: 3, active: true, hp: 2, cooldown: 30, hit_flash: 0 }, // Imp 2 (Far Southeast Room)
+    Sprite { x: 13.5, y: 3.5, kind: 3, active: true, hp: 2, cooldown: 40, hit_flash: 0 },  // Imp 3 (Far Northeast Room)
     Sprite { x: 13.5, y: 10.5, kind: 1, active: true, hp: 1, cooldown: 0, hit_flash: 0 }, // Barrel
     Sprite { x: 8.5, y: 12.5, kind: 2, active: true, hp: 1, cooldown: 0, hit_flash: 0 },  // Health Pack (+25 HP)
-    Sprite { x: 3.5, y: 11.5, kind: 3, active: true, hp: 2, cooldown: 60, hit_flash: 0 }, // Imp (2 HP)
     Sprite { x: 5.5, y: 10.5, kind: 4, active: true, hp: 1, cooldown: 0, hit_flash: 0 },  // Ammo Crate (+20 Ammo)
     Sprite { x: 10.5, y: 3.5, kind: 4, active: true, hp: 1, cooldown: 0, hit_flash: 0 },  // Ammo Crate (+20 Ammo)
 ];
@@ -426,8 +427,8 @@ async fn main(_spawner: Spawner) {
                 let dy = pos_y - fb.y;
                 let dist_sq = dx * dx + dy * dy;
 
-                if dist_sq < 0.36 { // Hits player!
-                    health_count = health_count.saturating_sub(15);
+                if dist_sq < 0.64 { // Hits player!
+                    health_count = health_count.saturating_sub(18);
                     damage_flash_counter = 8;
                     fb.active = false;
                 } else if fb.x < 0.5 || fb.x > 15.5 || fb.y < 0.5 || fb.y > 15.5 || MAP[(fb.y as usize) * MAP_SIZE + (fb.x as usize)] > 0 {
@@ -444,24 +445,26 @@ async fn main(_spawner: Spawner) {
                 let dx = pos_x - sprite.x;
                 let dy = pos_y - sprite.y;
                 let dist_sq = dx * dx + dy * dy;
-                if dist_sq < 64.0 && dist_sq > 0.5 { // Within range
+                if dist_sq < 100.0 && dist_sq > 0.4 { // Within line of sight
                     if sprite.cooldown > 0 {
                         sprite.cooldown -= 1;
                     } else {
                         // Spawn flying fireball from Imp to player
                         let dist = sqrtf(dist_sq).max(0.1);
-                        let speed = 0.16f32;
+                        let speed = 0.20f32; // Fast flying fireball
+                        let dir_u_x = dx / dist;
+                        let dir_u_y = dy / dist;
                         for fb in fireballs.iter_mut() {
                             if !fb.active {
-                                fb.x = sprite.x;
-                                fb.y = sprite.y;
-                                fb.vx = (dx / dist) * speed;
-                                fb.vy = (dy / dist) * speed;
+                                fb.x = sprite.x + dir_u_x * 0.4;
+                                fb.y = sprite.y + dir_u_y * 0.4;
+                                fb.vx = dir_u_x * speed;
+                                fb.vy = dir_u_y * speed;
                                 fb.active = true;
                                 break;
                             }
                         }
-                        sprite.cooldown = 90; // ~1.5 sec between attacks
+                        sprite.cooldown = 35; // Fast attack rate (~0.6s between fireballs)
                     }
                 }
             }
@@ -933,10 +936,10 @@ async fn main(_spawner: Spawner) {
             let death_title_style = MonoTextStyle::new(&FONT_6X10, Rgb565::WHITE);
             let death_sub_style   = MonoTextStyle::new(&FONT_6X10, Rgb565::YELLOW);
 
-            let _ = Text::with_baseline("========================", Point::new(12,  90), death_title_style, Baseline::Top).draw(&mut hud_offscreen);
-            let _ = Text::with_baseline("       YOU DIED!        ", Point::new(12, 105), death_title_style, Baseline::Top).draw(&mut hud_offscreen);
-            let _ = Text::with_baseline(" TAP TO RESPAWN (100% HP)", Point::new(12, 120), death_sub_style,   Baseline::Top).draw(&mut hud_offscreen);
-            let _ = Text::with_baseline("========================", Point::new(12, 135), death_title_style, Baseline::Top).draw(&mut hud_offscreen);
+            let _ = Text::with_baseline("================================", Point::new(24,  90), death_title_style, Baseline::Top).draw(&mut hud_offscreen);
+            let _ = Text::with_baseline("YOU DIED!",                    Point::new(93, 105), death_title_style, Baseline::Top).draw(&mut hud_offscreen);
+            let _ = Text::with_baseline("TAP TO RESPAWN",                Point::new(78, 122), death_sub_style,   Baseline::Top).draw(&mut hud_offscreen);
+            let _ = Text::with_baseline("================================", Point::new(24, 137), death_title_style, Baseline::Top).draw(&mut hud_offscreen);
         }
 
         // C. MODE label — right of face (x=140)
