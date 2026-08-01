@@ -158,15 +158,43 @@ fn pack_rgb565_u32(color: Rgb565) -> u32 {
     (raw << 16) | raw
 }
 
-fn get_wall_color(wall_type: u8, side: u8) -> Rgb565 {
-    let base = match wall_type {
-        1 => Rgb565::new(18, 36, 18), // Metal Grey
-        2 => Rgb565::new(28, 6, 6),   // Red Brick
-        3 => Rgb565::new(4, 18, 30),   // Blue Tech
-        4 => Rgb565::new(6, 26, 6),   // Mossy Stone
-        5 => Rgb565::new(30, 26, 4),  // Yellow Hazard
-        6 => Rgb565::new(22, 22, 22), // Pillar Column
-        _ => Rgb565::new(12, 12, 12),
+// ----------------------------------------------------------------------------
+// Authentic 1993 DOOM Wall Texture Generator (16x16 Bitmapped Patterns)
+// ----------------------------------------------------------------------------
+#[inline(always)]
+fn get_wall_texture_pixel(tile: u8, tex_x: usize, tex_y: usize, side: u8) -> Rgb565 {
+    let base = match tile {
+        1 => { // Red/Brown Brick Wall
+            let is_mortar = (tex_y % 4 == 0)
+                || ((tex_y / 4) % 2 == 0 && tex_x % 8 == 0)
+                || ((tex_y / 4) % 2 == 1 && (tex_x + 4) % 8 == 0);
+            if is_mortar { Rgb565::new(8, 8, 8) } else { Rgb565::new(22, 8, 4) }
+        }
+        2 => { // Tech Blue Panel
+            if tex_y == 2 || tex_y == 14 || (tex_x == 8 && tex_y > 4 && tex_y < 12) {
+                Rgb565::new(0, 48, 31) // Glowing Cyan/Blue LED
+            } else if tex_x == 0 || tex_x == 15 || tex_y == 0 || tex_y == 15 {
+                Rgb565::new(4, 6, 8) // Dark Steel Frame
+            } else {
+                Rgb565::new(10, 16, 20) // Tech Plate
+            }
+        }
+        3 => { // Hazard Warning Stripe
+            if (tex_x + tex_y) % 6 < 3 {
+                Rgb565::YELLOW
+            } else {
+                Rgb565::new(3, 3, 3)
+            }
+        }
+        _ => { // Reinforced Metal Door
+            if tex_x == 0 || tex_x == 15 || tex_y == 0 || tex_y == 15 {
+                Rgb565::new(25, 20, 0) // Brass Frame
+            } else if tex_x >= 12 && tex_x <= 13 && tex_y >= 7 && tex_y <= 9 {
+                Rgb565::YELLOW // Door Handle
+            } else {
+                Rgb565::new(14, 12, 10) // Dark Metal Panel
+            }
+        }
     };
     if side == 1 {
         // Dim EW walls slightly for fake directional lighting
@@ -198,7 +226,7 @@ async fn main(_spawner: Spawner) {
 
     defmt::info!("============================================");
     defmt::info!("DOOM E1M1-Inspired 3D Level Walkthrough Demo");
-    defmt::info!("Engine: DDA Fast Raycaster + 50MHz SPI DMA + DOOM HUD");
+    defmt::info!("Engine: DDA Fast Raycaster + 25MHz SPI DMA + DOOM HUD");
     defmt::info!("============================================");
 
     let mut spi_config = SpiConfig::default();
@@ -627,32 +655,52 @@ async fn main(_spawner: Spawner) {
             let draw_start = (center_y - line_height / 2).clamp(0, VIEW3D_HEIGHT as i32 - 1) as usize;
             let draw_end   = (center_y + line_height / 2).clamp(0, VIEW3D_HEIGHT as i32 - 1) as usize;
 
-            let wall_color   = get_wall_color(hit_wall, side);
-            let shade_factor = 1.0 / (1.0 + perp_wall_dist * 0.18);
-            let shaded_wall  = apply_shade(wall_color, shade_factor);
+            // Calculate exact fractional wall hit position for texture mapping
+            let mut wall_x = if side == 0 {
+                pos_y + perp_wall_dist * ray_dir_y
+            } else {
+                pos_x + perp_wall_dist * ray_dir_x
+            };
+            wall_x -= libm::floorf(wall_x);
+            let tex_x = ((wall_x * 16.0) as usize).clamp(0, 15);
 
+            let shade_factor = 1.0 / (1.0 + perp_wall_dist * 0.18);
             let ceiling_color = apply_shade(Rgb565::new(3, 6, 12), shade_factor * 0.5);
             let floor_color   = apply_shade(Rgb565::new(8, 6, 4),  shade_factor * 0.6);
 
-            let ceil_u32   = pack_rgb565_u32(ceiling_color);
-            let shaded_u32 = pack_rgb565_u32(shaded_wall);
-            let floor_u32  = pack_rgb565_u32(floor_color);
+            let ceil_u32  = pack_rgb565_u32(ceiling_color);
+            let floor_u32 = pack_rgb565_u32(floor_color);
 
             let framebuf_u32 = unsafe {
                 core::slice::from_raw_parts_mut(framebuf.as_mut_ptr() as *mut u32, VIEW_PIXELS / 2)
             };
 
             let x_u32 = x / 2;
+            // Ceiling
             for y in 0..draw_start {
                 let idx = y * 120 + x_u32;
                 framebuf_u32[idx]     = ceil_u32;
                 framebuf_u32[idx + 1] = ceil_u32;
             }
+
+            // Textured 3D Wall Column
+            let tex_step = 16.0 / (line_height as f32).max(1.0);
+            let mut tex_pos = ((draw_start as i32 - center_y + line_height / 2) as f32) * tex_step;
+
             for y in draw_start..=draw_end {
+                let tex_y = (tex_pos as usize) & 15;
+                tex_pos += tex_step;
+
+                let tex_color = get_wall_texture_pixel(hit_wall, tex_x, tex_y, side);
+                let shaded_pixel = apply_shade(tex_color, shade_factor);
+                let pixel_u32 = pack_rgb565_u32(shaded_pixel);
+
                 let idx = y * 120 + x_u32;
-                framebuf_u32[idx]     = shaded_u32;
-                framebuf_u32[idx + 1] = shaded_u32;
+                framebuf_u32[idx]     = pixel_u32;
+                framebuf_u32[idx + 1] = pixel_u32;
             }
+
+            // Floor
             for y in (draw_end + 1)..VIEW3D_HEIGHT {
                 let idx = y * 120 + x_u32;
                 framebuf_u32[idx]     = floor_u32;
