@@ -586,91 +586,25 @@ async fn main(_spawner: Spawner) {
         let plane_y = dir_x * fov_scale;
 
         // --------------------------------------------------------------------
-        // 2. Mode 7 True 3D Perspective Floor & Ceiling Raycaster Engine
         // --------------------------------------------------------------------
-        let center_y = (VIEW3D_HEIGHT / 2) as i32 + head_bob;
-        let ray_dir_x0 = dir_x + plane_x;
-        let ray_dir_y0 = dir_y + plane_y;
-        let ray_dir_x1 = dir_x - plane_x;
-        let ray_dir_y1 = dir_y - plane_y;
-
+        // 2. Mode 7 True 3D Perspective Floor & Ceiling Engine (via embedded-3dgfx crate)
+        // --------------------------------------------------------------------
         let framebuf_u32 = unsafe {
             core::slice::from_raw_parts_mut(framebuf.as_mut_ptr() as *mut u32, VIEW_PIXELS / 2)
         };
 
-        // A. True Mode 7 Perspective Floor (Vanishing point on horizon)
-        for y in (center_y.clamp(0, VIEW3D_HEIGHT as i32) as usize)..VIEW3D_HEIGHT {
-            let p = (y as i32 - center_y).max(1);
-            let row_dist = (0.5 * VIEW3D_HEIGHT as f32) / (p as f32);
-
-            let floor_step_x = row_dist * (ray_dir_x1 - ray_dir_x0) / (VIEW_WIDTH as f32);
-            let floor_step_y = row_dist * (ray_dir_y1 - ray_dir_y0) / (VIEW_WIDTH as f32);
-
-            let mut floor_x = pos_x + row_dist * ray_dir_x0;
-            let mut floor_y = pos_y + row_dist * ray_dir_y0;
-
-            let f_shade = (1.0 / (1.0 + row_dist * 0.18)).clamp(0.08, 0.85);
-            let row_u32 = y * 120;
-
-            for x_u32 in 0..120 {
-                let cell_x = floor_x as i32;
-                let cell_y = floor_y as i32;
-
-                let tx = ((floor_x - cell_x as f32) * 16.0) as usize & 15;
-                let ty = ((floor_y - cell_y as f32) * 16.0) as usize & 15;
-
-                let is_mortar = (tx == 0) || (ty == 0);
-                let f_base = if is_mortar {
-                    Rgb565::new(4, 3, 2)
-                } else if (cell_x + cell_y) % 2 == 0 {
-                    Rgb565::new(16, 12, 4) // E1M1 Tan Stone Tile A
-                } else {
-                    Rgb565::new(11, 8, 3)  // Dark Stone Tile B
-                };
-
-                framebuf_u32[row_u32 + x_u32] = pack_rgb565_u32(apply_shade(f_base, f_shade));
-
-                floor_x += floor_step_x * 2.0;
-                floor_y += floor_step_y * 2.0;
-            }
-        }
-
-        // B. True Mode 7 Perspective Ceiling (Vanishing point on horizon)
-        for y in 0..(center_y.clamp(0, VIEW3D_HEIGHT as i32) as usize) {
-            let p = (center_y - y as i32).max(1);
-            let row_dist = (0.5 * VIEW3D_HEIGHT as f32) / (p as f32);
-
-            let ceil_step_x = row_dist * (ray_dir_x1 - ray_dir_x0) / (VIEW_WIDTH as f32);
-            let ceil_step_y = row_dist * (ray_dir_y1 - ray_dir_y0) / (VIEW_WIDTH as f32);
-
-            let mut ceil_x = pos_x + row_dist * ray_dir_x0;
-            let mut ceil_y = pos_y + row_dist * ray_dir_y0;
-
-            let c_shade = (1.0 / (1.0 + row_dist * 0.22)).clamp(0.08, 0.7);
-            let row_u32 = y * 120;
-
-            for x_u32 in 0..120 {
-                let cell_x = ceil_x as i32;
-                let cell_y = ceil_y as i32;
-
-                let tx = ((ceil_x - cell_x as f32) * 16.0) as usize & 15;
-                let ty = ((ceil_y - cell_y as f32) * 16.0) as usize & 15;
-
-                let is_beam = (tx == 0) || (ty == 0);
-                let c_base = if is_beam {
-                    Rgb565::new(2, 4, 8)  // Structural Steel Beam
-                } else if (cell_x + cell_y) % 2 == 0 {
-                    Rgb565::new(6, 12, 18) // Tech Ceiling Panel A
-                } else {
-                    Rgb565::new(4, 8, 14)  // Tech Ceiling Panel B
-                };
-
-                framebuf_u32[row_u32 + x_u32] = pack_rgb565_u32(apply_shade(c_base, c_shade));
-
-                ceil_x += ceil_step_x * 2.0;
-                ceil_y += ceil_step_y * 2.0;
-            }
-        }
+        let mode7_renderer = embedded_3dgfx::raycast::Mode7Renderer::new(VIEW_WIDTH, VIEW3D_HEIGHT);
+        mode7_renderer.render_floor_and_ceiling(
+            pos_x,
+            pos_y,
+            angle,
+            head_bob,
+            Rgb565::new(16, 12, 4), // E1M1 Tan Stone Tile A
+            Rgb565::new(11, 8, 3),  // Dark Stone Tile B
+            Rgb565::new(6, 12, 18), // Tech Ceiling Panel A
+            Rgb565::new(4, 8, 14),  // Tech Ceiling Panel B
+            framebuf_u32,
+        );
 
         // --------------------------------------------------------------------
         // 2.5 DDA 3D Wall Column Rendering

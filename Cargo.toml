@@ -31,7 +31,7 @@ display-interface = "0.5.0"
 display-interface-spi = "0.5.0"
 mipidsi = "0.9.0"
 
-embedded-3dgfx = { version = "0.4.1", default-features = false, features = ["row_width_320", "depth-u16", "physics"] }
+embedded-3dgfx = { git = "https://github.com/leftger/embedded-3dgfx", branch = "master", default-features = false, features = ["row_width_320", "depth-u16", "physics"] }
 nalgebra = { version = "0.34", default-features = false, features = ["libm"] }
 libm = "0.2.11"
 

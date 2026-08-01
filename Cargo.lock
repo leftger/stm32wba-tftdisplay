@@ -466,8 +466,7 @@ dependencies = [
 [[package]]
 name = "embedded-3dgfx"
 version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf5eb241d549fd39992d0e5853b5b4b3073dd10a0b19fe1abf5ad4686dea9c8c"
+source = "git+https://github.com/leftger/embedded-3dgfx?branch=master#ade04120dbc5a7a57bd10b5cce0827c271fb9441"
 dependencies = [
  "critical-section",
  "embedded-graphics-core",
