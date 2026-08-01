@@ -104,25 +104,38 @@ static PATROL_PATH: [Waypoint; 8] = [
     Waypoint { x: 2.5, y: 12.5 },
 ];
 
-// 3D World Sprites (Barrels, Health Kits, Imp Silhouettes, Ammo Crates)
+// 3D World Sprites (Barrels, Health Kits, Imp Enemies, Ammo Crates)
 #[derive(Clone, Copy)]
 struct Sprite {
     x: f32,
     y: f32,
-    kind: u8, // 1 = Barrel, 2 = Health Kit, 3 = Imp Enemy, 4 = Ammo Crate
+    kind: u8,       // 1 = Barrel, 2 = Health Kit, 3 = Imp Enemy, 4 = Ammo Crate
     active: bool,
+    hp: i8,          // Enemy HP (Imps start with 2 HP)
+    cooldown: u8,    // Attack cooldown timer
+    hit_flash: u8,   // Flash white on hit
 }
 
 static INITIAL_SPRITES: [Sprite; 8] = [
-    Sprite { x: 3.5, y: 3.5, kind: 1, active: true },   // Barrel
-    Sprite { x: 7.5, y: 4.0, kind: 2, active: true },   // Health Pack (+25 HP)
-    Sprite { x: 12.5, y: 4.5, kind: 3, active: true },  // Imp
-    Sprite { x: 13.5, y: 10.5, kind: 1, active: true }, // Barrel
-    Sprite { x: 8.5, y: 12.5, kind: 2, active: true },  // Health Pack (+25 HP)
-    Sprite { x: 3.5, y: 11.5, kind: 3, active: true },  // Imp
-    Sprite { x: 5.5, y: 10.5, kind: 4, active: true },  // Ammo Crate (+20 Ammo)
-    Sprite { x: 10.5, y: 3.5, kind: 4, active: true },  // Ammo Crate (+20 Ammo)
+    Sprite { x: 3.5, y: 3.5, kind: 1, active: true, hp: 1, cooldown: 0, hit_flash: 0 },   // Barrel
+    Sprite { x: 7.5, y: 4.0, kind: 2, active: true, hp: 1, cooldown: 0, hit_flash: 0 },   // Health Pack (+25 HP)
+    Sprite { x: 12.5, y: 4.5, kind: 3, active: true, hp: 2, cooldown: 40, hit_flash: 0 }, // Imp (2 HP)
+    Sprite { x: 13.5, y: 10.5, kind: 1, active: true, hp: 1, cooldown: 0, hit_flash: 0 }, // Barrel
+    Sprite { x: 8.5, y: 12.5, kind: 2, active: true, hp: 1, cooldown: 0, hit_flash: 0 },  // Health Pack (+25 HP)
+    Sprite { x: 3.5, y: 11.5, kind: 3, active: true, hp: 2, cooldown: 60, hit_flash: 0 }, // Imp (2 HP)
+    Sprite { x: 5.5, y: 10.5, kind: 4, active: true, hp: 1, cooldown: 0, hit_flash: 0 },  // Ammo Crate (+20 Ammo)
+    Sprite { x: 10.5, y: 3.5, kind: 4, active: true, hp: 1, cooldown: 0, hit_flash: 0 },  // Ammo Crate (+20 Ammo)
 ];
+
+// 3D World Fireball Projectile
+#[derive(Clone, Copy)]
+struct Fireball {
+    x: f32,
+    y: f32,
+    vx: f32,
+    vy: f32,
+    active: bool,
+}
 
 
 
@@ -259,11 +272,13 @@ async fn main(_spawner: Spawner) {
     let mut touch_hold_counter: u8 = 0;
 
     let mut ammo_count: u16 = 50;
-    let mut health_count: u16 = 80; // Start at 80% so pickups demonstrate replenishment
+    let mut health_count: u16 = 80;
     let mut muzzle_flash_counter: u8 = 0;
     let mut pickup_flash_counter: u8 = 0;
+    let mut damage_flash_counter: u8 = 0;
 
     let mut sprites = INITIAL_SPRITES;
+    let mut fireballs = [Fireball { x: 0.0, y: 0.0, vx: 0.0, vy: 0.0, active: false }; 4];
     let mut respawn_timer: u16 = 0;
 
     let mut ticker = Ticker::every(Duration::from_millis(16)); // Target 60 FPS
@@ -285,6 +300,11 @@ async fn main(_spawner: Spawner) {
         // --------------------------------------------------------------------
         let dir_x = cosf(angle);
         let dir_y = sinf(angle);
+
+        // Camera plane for 66-degree FOV
+        let fov_scale = 0.66f32;
+        let plane_x = -dir_y * fov_scale;
+        let plane_y = dir_x * fov_scale;
 
         let mut b1_pressed = btn1.is_low(); // B1 (Leftmost): Turn Right
         let mut b2_pressed = btn2.is_low(); // B2 (Center): Move Forward
@@ -330,6 +350,28 @@ async fn main(_spawner: Spawner) {
             if ammo_count > 0 {
                 ammo_count -= 1;
                 muzzle_flash_counter = 4; // Flash for 4 frames
+
+                // Player Raycast Shot Hit Detection vs Active Enemies
+                for sprite in sprites.iter_mut() {
+                    if sprite.active && sprite.kind == 3 {
+                        let sprite_x = sprite.x - pos_x;
+                        let sprite_y = sprite.y - pos_y;
+                        let inv_det = 1.0 / (plane_x * dir_y - dir_x * plane_y);
+                        let transform_x = inv_det * (dir_y * sprite_x - dir_x * sprite_y);
+                        let transform_y = inv_det * (-plane_y * sprite_x + plane_x * sprite_y);
+                        if transform_y > 0.3 {
+                            let sprite_screen_x = ((VIEW_WIDTH as f32 / 2.0) * (1.0 - transform_x / transform_y)) as i32;
+                            let sprite_width = ((VIEW3D_HEIGHT as f32 / transform_y).abs()) as i32;
+                            if (120 - sprite_screen_x).abs() < sprite_width / 2 + 12 {
+                                sprite.hp -= 1;
+                                sprite.hit_flash = 5; // Flash white on impact
+                                if sprite.hp <= 0 {
+                                    sprite.active = false; // Defeated Imp
+                                }
+                            }
+                        }
+                    }
+                }
             }
         } else if muzzle_flash_counter > 0 {
             muzzle_flash_counter -= 1;
@@ -371,16 +413,82 @@ async fn main(_spawner: Spawner) {
         }
 
         // --------------------------------------------------------------------
-        // 1.5 Pickup & Stat Replenishment Logic (Health Packs & Ammo Crates)
+        // 1.5 Flying 3D Fireballs & Enemy Attack AI
         // --------------------------------------------------------------------
-        let mut any_pickup_active = false;
+        let is_dead = health_count == 0;
+
+        // Update active flying fireballs
+        for fb in fireballs.iter_mut() {
+            if fb.active {
+                fb.x += fb.vx;
+                fb.y += fb.vy;
+                let dx = pos_x - fb.x;
+                let dy = pos_y - fb.y;
+                let dist_sq = dx * dx + dy * dy;
+
+                if dist_sq < 0.36 { // Hits player!
+                    health_count = health_count.saturating_sub(15);
+                    damage_flash_counter = 8;
+                    fb.active = false;
+                } else if fb.x < 0.5 || fb.x > 15.5 || fb.y < 0.5 || fb.y > 15.5 || MAP[(fb.y as usize) * MAP_SIZE + (fb.x as usize)] > 0 {
+                    fb.active = false; // Hits wall
+                }
+            }
+        }
+
+        // Imp Attack AI (Launches visible flying fireballs)
         for sprite in sprites.iter_mut() {
+            if sprite.hit_flash > 0 { sprite.hit_flash -= 1; }
+
+            if sprite.active && sprite.kind == 3 && !is_dead {
+                let dx = pos_x - sprite.x;
+                let dy = pos_y - sprite.y;
+                let dist_sq = dx * dx + dy * dy;
+                if dist_sq < 64.0 && dist_sq > 0.5 { // Within range
+                    if sprite.cooldown > 0 {
+                        sprite.cooldown -= 1;
+                    } else {
+                        // Spawn flying fireball from Imp to player
+                        let dist = sqrtf(dist_sq).max(0.1);
+                        let speed = 0.16f32;
+                        for fb in fireballs.iter_mut() {
+                            if !fb.active {
+                                fb.x = sprite.x;
+                                fb.y = sprite.y;
+                                fb.vx = (dx / dist) * speed;
+                                fb.vy = (dy / dist) * speed;
+                                fb.active = true;
+                                break;
+                            }
+                        }
+                        sprite.cooldown = 90; // ~1.5 sec between attacks
+                    }
+                }
+            }
+        }
+
+        // Tap to Respawn when Dead
+        if is_dead && (b1_pressed || b2_pressed || b3_pressed || shoot_pressed || move_backward) {
+            health_count = 100;
+            ammo_count = 50;
+            pos_x = PATROL_PATH[0].x;
+            pos_y = PATROL_PATH[0].y;
+            angle = 0.0;
+            sprites = INITIAL_SPRITES;
+            for fb in fireballs.iter_mut() { fb.active = false; }
+        }
+
+        // Pickups (Health Packs & Ammo Crates)
+        let mut any_pickup_active = false;
+        let mut any_enemy_active = false;
+        for sprite in sprites.iter_mut() {
+            if sprite.kind == 3 && sprite.active { any_enemy_active = true; }
             if sprite.kind == 2 || sprite.kind == 4 {
                 if sprite.active {
                     any_pickup_active = true;
                     let dx = pos_x - sprite.x;
                     let dy = pos_y - sprite.y;
-                    if dx * dx + dy * dy < 0.49 { // Within 0.7 units distance
+                    if dx * dx + dy * dy < 0.49 {
                         if sprite.kind == 2 && health_count < 100 {
                             health_count = (health_count + 25).min(100);
                             sprite.active = false;
@@ -395,19 +503,19 @@ async fn main(_spawner: Spawner) {
             }
         }
 
-        // Automatic respawn timer if all pickups were collected
-        if !any_pickup_active {
+        // Respawn all sprites (enemies + pickups) if all cleared
+        if !any_pickup_active || !any_enemy_active {
             respawn_timer += 1;
-            if respawn_timer > 450 { // Respawn after ~7.5 seconds
+            if respawn_timer > 500 { // Respawn after ~8 seconds
                 for sprite in sprites.iter_mut() {
-                    if sprite.kind == 2 || sprite.kind == 4 {
-                        sprite.active = true;
-                    }
+                    sprite.active = true;
+                    if sprite.kind == 3 { sprite.hp = 2; sprite.cooldown = 40; }
                 }
                 respawn_timer = 0;
             }
         }
         if pickup_flash_counter > 0 { pickup_flash_counter -= 1; }
+        if damage_flash_counter > 0 { damage_flash_counter -= 1; }
 
         let is_manual = manual_mode_timer > 0;
         let mut angle_diff = 0.0f32;
@@ -550,7 +658,7 @@ async fn main(_spawner: Spawner) {
         }
 
         // --------------------------------------------------------------------
-        // 3. Render Billboarded 3D Sprites (Barrels, Health, Enemies, Ammo)
+        // 3. Render Billboarded 3D Sprites & Flying Fireballs
         // --------------------------------------------------------------------
         for sprite in sprites.iter() {
             if !sprite.active { continue; }
@@ -574,21 +682,64 @@ async fn main(_spawner: Spawner) {
                 let draw_start_x = (sprite_screen_x - sprite_width / 2).clamp(0, VIEW_WIDTH as i32 - 1) as usize;
                 let draw_end_x = (sprite_screen_x + sprite_width / 2).clamp(0, VIEW_WIDTH as i32 - 1) as usize;
 
-                let sprite_color = match sprite.kind {
-                    1 => Rgb565::YELLOW,                   // Barrel
-                    2 => Rgb565::GREEN,                    // Health Pack (+25 HP)
-                    3 => Rgb565::RED,                      // Imp Enemy
-                    _ => Rgb565::new(0, 48, 31),           // Ammo Crate (Cyan/Blue)
+                let base_color = if sprite.hit_flash > 0 {
+                    Rgb565::WHITE // White impact flash when shot!
+                } else {
+                    match sprite.kind {
+                        1 => Rgb565::new(16, 40, 8),           // Toxic Green Barrel
+                        2 => Rgb565::GREEN,                    // Health Pack (+25 HP)
+                        3 => Rgb565::new(18, 10, 4),           // Classic DOOM Ochre-Brown Imp
+                        _ => Rgb565::new(0, 36, 31),           // Steel Blue Ammo Crate
+                    }
                 };
-                let shaded_sprite = apply_shade(sprite_color, 1.0 / (1.0 + transform_y * 0.2));
+                let shaded_sprite = apply_shade(base_color, 1.0 / (1.0 + transform_y * 0.2));
 
                 for stripe_x in draw_start_x..draw_end_x {
                     if transform_y < z_buffer[stripe_x] {
                         for y in draw_start_y..draw_end_y {
                             let row = y * VIEW_WIDTH;
+                            // Imp red eye detail near the top of the sprite head
+                            let pixel_color = if sprite.kind == 3 && sprite.hit_flash == 0 && y >= draw_start_y + (draw_end_y - draw_start_y) / 6 && y <= draw_start_y + (draw_end_y - draw_start_y) / 4 {
+                                Rgb565::RED
+                            } else {
+                                shaded_sprite
+                            };
                             if (stripe_x + y) % 2 == 0 {
-                                framebuf[row + stripe_x] = shaded_sprite;
+                                framebuf[row + stripe_x] = pixel_color;
                             }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Render Flying 3D Fireballs (Glowing Orange/Yellow Orbs)
+        for fb in fireballs.iter() {
+            if !fb.active { continue; }
+            let fb_x = fb.x - pos_x;
+            let fb_y = fb.y - pos_y;
+
+            let inv_det = 1.0 / (plane_x * dir_y - dir_x * plane_y);
+            let transform_x = inv_det * (dir_y * fb_x - dir_x * fb_y);
+            let transform_y = inv_det * (-plane_y * fb_x + plane_x * fb_y);
+
+            if transform_y > 0.3 {
+                let fb_screen_x = ((VIEW_WIDTH as f32 / 2.0) * (1.0 - transform_x / transform_y)) as i32;
+                let fb_size = (((VIEW3D_HEIGHT as f32 / transform_y).abs()) * 0.4) as i32;
+
+                let center_y = (VIEW3D_HEIGHT / 2) as i32 + head_bob;
+                let draw_start_y = (center_y - fb_size / 2).clamp(0, VIEW3D_HEIGHT as i32 - 1) as usize;
+                let draw_end_y = (center_y + fb_size / 2).clamp(0, VIEW3D_HEIGHT as i32 - 1) as usize;
+
+                let draw_start_x = (fb_screen_x - fb_size / 2).clamp(0, VIEW_WIDTH as i32 - 1) as usize;
+                let draw_end_x = (fb_screen_x + fb_size / 2).clamp(0, VIEW_WIDTH as i32 - 1) as usize;
+
+                let fb_color = Rgb565::new(31, 32, 0); // Fiery Glowing Orange
+
+                for stripe_x in draw_start_x..draw_end_x {
+                    if transform_y < z_buffer[stripe_x] {
+                        for y in draw_start_y..draw_end_y {
+                            framebuf[y * VIEW_WIDTH + stripe_x] = fb_color;
                         }
                     }
                 }
@@ -644,6 +795,28 @@ async fn main(_spawner: Spawner) {
                     let fx_start = flash_center_x.saturating_sub(radius);
                     let fx_end   = (flash_center_x + radius).min(239);
                     framebuf[row + fx_start..=row + fx_end].fill(if dy % 2 == 0 { flash_yellow } else { flash_orange });
+                }
+            }
+        }
+
+        // --------------------------------------------------------------------
+        // 4.5 Damage Flash Animation: Semi-Transparent Red Viewport Border (Not HUD)
+        // --------------------------------------------------------------------
+        if damage_flash_counter > 0 {
+            let border_width = 12usize;
+            let red_flash = Rgb565::RED;
+
+            for y in 0..VIEW3D_HEIGHT {
+                let row = y * VIEW_WIDTH;
+                let is_top_bottom_border = y < border_width || y >= VIEW3D_HEIGHT - border_width;
+                for x in 0..VIEW_WIDTH {
+                    let is_left_right_border = x < border_width || x >= VIEW_WIDTH - border_width;
+                    if is_top_bottom_border || is_left_right_border {
+                        // Semi-transparent checkerboard mesh overlay over 3D viewport edges
+                        if (x + y) % 2 == 0 {
+                            framebuf[row + x] = red_flash;
+                        }
+                    }
                 }
             }
         }
@@ -714,7 +887,7 @@ async fn main(_spawner: Spawner) {
         }
         let eye_offset = if angle_diff > 0.05 { 2i32 } else if angle_diff < -0.05 { -2 } else { 0 };
         let skin_color  = Rgb565::new(28, 20, 16);
-        let eye_color   = if muzzle_flash_counter > 0 { Rgb565::RED } else { Rgb565::WHITE };
+        let eye_color   = if is_dead || damage_flash_counter > 0 || muzzle_flash_counter > 0 { Rgb565::RED } else { Rgb565::WHITE };
         let pupil_color = Rgb565::BLACK;
         for fy in (face_box_y + 8)..(face_box_y + 44) {
             let row = fy * VIEW_WIDTH;
@@ -729,12 +902,41 @@ async fn main(_spawner: Spawner) {
         framebuf[eye_row + px1] = pupil_color;
         framebuf[eye_row + px2] = pupil_color;
 
-        // Grinning teeth when shooting vs normal mouth
+        // Grinning teeth when shooting / Ouch expression / Dead eyes
         let mouth_row = (face_box_y + 34) * VIEW_WIDTH;
-        if muzzle_flash_counter > 0 {
+        if is_dead {
+            framebuf[mouth_row + face_box_x + 4..mouth_row + face_box_x + 24].fill(Rgb565::BLACK);
+        } else if muzzle_flash_counter > 0 {
             framebuf[mouth_row + face_box_x + 8..mouth_row + face_box_x + 20].fill(Rgb565::WHITE);
+        } else if damage_flash_counter > 0 {
+            framebuf[mouth_row + face_box_x + 6..mouth_row + face_box_x + 22].fill(Rgb565::new(31, 10, 0));
         } else {
             framebuf[mouth_row + face_box_x + 8..mouth_row + face_box_x + 20].fill(Rgb565::RED);
+        }
+
+        // YOU DIED Screen Overlay
+        if is_dead {
+            // Blood Red Mesh Screen Tint
+            for y in 0..VIEW3D_HEIGHT {
+                let row = y * VIEW_WIDTH;
+                for x in 0..VIEW_WIDTH {
+                    if (x + y) % 2 == 0 {
+                        framebuf[row + x] = Rgb565::RED;
+                    }
+                }
+            }
+
+            let mut hud_offscreen = OffscreenBuffer {
+                pixels: framebuf,
+                dirty: DirtyRect::empty(),
+            };
+            let death_title_style = MonoTextStyle::new(&FONT_6X10, Rgb565::WHITE);
+            let death_sub_style   = MonoTextStyle::new(&FONT_6X10, Rgb565::YELLOW);
+
+            let _ = Text::with_baseline("========================", Point::new(12,  90), death_title_style, Baseline::Top).draw(&mut hud_offscreen);
+            let _ = Text::with_baseline("       YOU DIED!        ", Point::new(12, 105), death_title_style, Baseline::Top).draw(&mut hud_offscreen);
+            let _ = Text::with_baseline(" TAP TO RESPAWN (100% HP)", Point::new(12, 120), death_sub_style,   Baseline::Top).draw(&mut hud_offscreen);
+            let _ = Text::with_baseline("========================", Point::new(12, 135), death_title_style, Baseline::Top).draw(&mut hud_offscreen);
         }
 
         // C. MODE label — right of face (x=140)
