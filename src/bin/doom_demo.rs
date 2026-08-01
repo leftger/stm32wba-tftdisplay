@@ -202,7 +202,7 @@ async fn main(_spawner: Spawner) {
     defmt::info!("============================================");
 
     let mut spi_config = SpiConfig::default();
-    spi_config.frequency = Hertz(50_000_000);
+    spi_config.frequency = Hertz(25_000_000); // Rock-solid 25 MHz SPI bus
 
     let spi = Spi::new(
         p.SPI2,
