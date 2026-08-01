@@ -11,6 +11,8 @@ use embassy_stm32::dma::InterruptHandler;
 use embassy_stm32::gpio::{Input, Level, Output, Pull, Speed};
 use embassy_stm32::peripherals;
 use embassy_stm32::rcc::*;
+use embassy_stm32::i2c::{Config as I2cConfig, I2c};
+use ft6x06_rs::FT6x06;
 use embassy_stm32::spi::{Config as SpiConfig, Spi};
 use embassy_stm32::time::Hertz;
 use embassy_stm32::Config;
@@ -212,6 +214,17 @@ async fn main(_spawner: Spawner) {
     let btn2 = Input::new(p.PC5, Pull::Up);  // USER2 Button B2 (Center): Move Forward (PC5)
     let btn3 = Input::new(p.PB4, Pull::Up);  // USER3 Button B3 (Rightmost): Turn Right (PB4)
 
+    // Touch Controller I2C1 Setup (SDA=PB1, SCL=PB2, INT=PE0) using FT6x06 driver crate
+    let i2c_config = I2cConfig::default();
+    let mut i2c = I2c::new_blocking(
+        p.I2C1,
+        p.PB2, // SCL (Arduino D15)
+        p.PB1, // SDA (Arduino D14)
+        i2c_config,
+    );
+    let touch_int = Input::new(p.PE0, Pull::Up); // T_IRQ (Arduino D2)
+    let mut touch_dev = FT6x06::new(&mut i2c);
+
     let mut use_buf_a = true;
 
 
@@ -254,9 +267,26 @@ async fn main(_spawner: Spawner) {
         let dir_x = cosf(angle);
         let dir_y = sinf(angle);
 
-        let b1_pressed = btn1.is_low(); // B1 (Leftmost): Turn Right
-        let b2_pressed = btn2.is_low(); // B2 (Center): Move Forward
-        let b3_pressed = btn3.is_low(); // B3 (Rightmost): Turn Left
+        let mut b1_pressed = btn1.is_low(); // B1 (Leftmost): Turn Right
+        let mut b2_pressed = btn2.is_low(); // B2 (Center): Move Forward
+        let mut b3_pressed = btn3.is_low(); // B3 (Rightmost): Turn Left
+
+        // FT6x06 Touch Controller Crate Polling
+        if touch_int.is_low() {
+            if let Ok(Some(evt)) = touch_dev.get_touch_event() {
+                let touch_x = evt.primary_point.x;
+                let touch_y = evt.primary_point.y;
+                if touch_x < 240 && touch_y < 320 {
+                    if touch_x < 80 {
+                        b3_pressed = true;
+                    } else if touch_x > 160 {
+                        b1_pressed = true;
+                    } else {
+                        b2_pressed = true;
+                    }
+                }
+            }
+        }
 
         if b1_pressed || b2_pressed || b3_pressed {
             manual_mode_timer = 300; // Reset 5-second manual control timeout

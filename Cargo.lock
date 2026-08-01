@@ -642,6 +642,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 
 [[package]]
+name = "ft6x06-rs"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f4a9edfc4b3ea5d5f0bb754a5b80ff8b8f3664ca58f876f2e3143402168d0488"
+dependencies = [
+ "defmt 0.3.100",
+ "embedded-hal 1.0.0",
+]
+
+[[package]]
 name = "futures-core"
 version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1299,6 +1309,7 @@ dependencies = [
  "embedded-graphics-core",
  "embedded-hal 1.0.0",
  "embedded-hal-bus",
+ "ft6x06-rs",
  "libm",
  "mipidsi",
  "nalgebra",
