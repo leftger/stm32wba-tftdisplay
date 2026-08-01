@@ -104,21 +104,24 @@ static PATROL_PATH: [Waypoint; 8] = [
     Waypoint { x: 2.5, y: 12.5 },
 ];
 
-// 3D World Sprites (Barrels, Health Kits, Imp Silhouettes)
+// 3D World Sprites (Barrels, Health Kits, Imp Silhouettes, Ammo Crates)
 #[derive(Clone, Copy)]
 struct Sprite {
     x: f32,
     y: f32,
-    kind: u8, // 1 = Barrel, 2 = Health Kit, 3 = Imp Enemy
+    kind: u8, // 1 = Barrel, 2 = Health Kit, 3 = Imp Enemy, 4 = Ammo Crate
+    active: bool,
 }
 
-static SPRITES: [Sprite; 6] = [
-    Sprite { x: 3.5, y: 3.5, kind: 1 }, // Barrel
-    Sprite { x: 7.5, y: 4.0, kind: 2 }, // Health Kit
-    Sprite { x: 12.5, y: 4.5, kind: 3 }, // Imp
-    Sprite { x: 13.5, y: 10.5, kind: 1 }, // Barrel
-    Sprite { x: 8.5, y: 12.5, kind: 2 }, // Health Kit
-    Sprite { x: 3.5, y: 11.5, kind: 3 }, // Imp
+static INITIAL_SPRITES: [Sprite; 8] = [
+    Sprite { x: 3.5, y: 3.5, kind: 1, active: true },   // Barrel
+    Sprite { x: 7.5, y: 4.0, kind: 2, active: true },   // Health Pack (+25 HP)
+    Sprite { x: 12.5, y: 4.5, kind: 3, active: true },  // Imp
+    Sprite { x: 13.5, y: 10.5, kind: 1, active: true }, // Barrel
+    Sprite { x: 8.5, y: 12.5, kind: 2, active: true },  // Health Pack (+25 HP)
+    Sprite { x: 3.5, y: 11.5, kind: 3, active: true },  // Imp
+    Sprite { x: 5.5, y: 10.5, kind: 4, active: true },  // Ammo Crate (+20 Ammo)
+    Sprite { x: 10.5, y: 3.5, kind: 4, active: true },  // Ammo Crate (+20 Ammo)
 ];
 
 
@@ -256,7 +259,12 @@ async fn main(_spawner: Spawner) {
     let mut touch_hold_counter: u8 = 0;
 
     let mut ammo_count: u16 = 50;
+    let mut health_count: u16 = 80; // Start at 80% so pickups demonstrate replenishment
     let mut muzzle_flash_counter: u8 = 0;
+    let mut pickup_flash_counter: u8 = 0;
+
+    let mut sprites = INITIAL_SPRITES;
+    let mut respawn_timer: u16 = 0;
 
     let mut ticker = Ticker::every(Duration::from_millis(16)); // Target 60 FPS
 
@@ -361,6 +369,45 @@ async fn main(_spawner: Spawner) {
         } else if manual_mode_timer > 0 {
             manual_mode_timer -= 1;
         }
+
+        // --------------------------------------------------------------------
+        // 1.5 Pickup & Stat Replenishment Logic (Health Packs & Ammo Crates)
+        // --------------------------------------------------------------------
+        let mut any_pickup_active = false;
+        for sprite in sprites.iter_mut() {
+            if sprite.kind == 2 || sprite.kind == 4 {
+                if sprite.active {
+                    any_pickup_active = true;
+                    let dx = pos_x - sprite.x;
+                    let dy = pos_y - sprite.y;
+                    if dx * dx + dy * dy < 0.49 { // Within 0.7 units distance
+                        if sprite.kind == 2 && health_count < 100 {
+                            health_count = (health_count + 25).min(100);
+                            sprite.active = false;
+                            pickup_flash_counter = 6;
+                        } else if sprite.kind == 4 && ammo_count < 999 {
+                            ammo_count = (ammo_count + 20).min(999);
+                            sprite.active = false;
+                            pickup_flash_counter = 6;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Automatic respawn timer if all pickups were collected
+        if !any_pickup_active {
+            respawn_timer += 1;
+            if respawn_timer > 450 { // Respawn after ~7.5 seconds
+                for sprite in sprites.iter_mut() {
+                    if sprite.kind == 2 || sprite.kind == 4 {
+                        sprite.active = true;
+                    }
+                }
+                respawn_timer = 0;
+            }
+        }
+        if pickup_flash_counter > 0 { pickup_flash_counter -= 1; }
 
         let is_manual = manual_mode_timer > 0;
         let mut angle_diff = 0.0f32;
@@ -503,9 +550,11 @@ async fn main(_spawner: Spawner) {
         }
 
         // --------------------------------------------------------------------
-        // 3. Render Billboarded 3D Sprites (Barrels, Health, Enemies)
+        // 3. Render Billboarded 3D Sprites (Barrels, Health, Enemies, Ammo)
         // --------------------------------------------------------------------
-        for sprite in SPRITES.iter() {
+        for sprite in sprites.iter() {
+            if !sprite.active { continue; }
+
             let sprite_x = sprite.x - pos_x;
             let sprite_y = sprite.y - pos_y;
 
@@ -514,8 +563,6 @@ async fn main(_spawner: Spawner) {
             let transform_y = inv_det * (-plane_y * sprite_x + plane_x * sprite_y);
 
             if transform_y > 0.3 {
-                // Negate transform_x to compensate for flip_horizontal display orientation
-                // (must match the negated camera_x used in the raycaster)
                 let sprite_screen_x = ((VIEW_WIDTH as f32 / 2.0) * (1.0 - transform_x / transform_y)) as i32;
                 let sprite_height = ((VIEW3D_HEIGHT as f32 / transform_y).abs()) as i32;
                 let sprite_width = sprite_height;
@@ -528,9 +575,10 @@ async fn main(_spawner: Spawner) {
                 let draw_end_x = (sprite_screen_x + sprite_width / 2).clamp(0, VIEW_WIDTH as i32 - 1) as usize;
 
                 let sprite_color = match sprite.kind {
-                    1 => Rgb565::YELLOW, // Barrel
-                    2 => Rgb565::GREEN,  // Health Pack
-                    _ => Rgb565::RED,    // Imp Enemy
+                    1 => Rgb565::YELLOW,                   // Barrel
+                    2 => Rgb565::GREEN,                    // Health Pack (+25 HP)
+                    3 => Rgb565::RED,                      // Imp Enemy
+                    _ => Rgb565::new(0, 48, 31),           // Ammo Crate (Cyan/Blue)
                 };
                 let shaded_sprite = apply_shade(sprite_color, 1.0 / (1.0 + transform_y * 0.2));
 
@@ -538,7 +586,6 @@ async fn main(_spawner: Spawner) {
                     if transform_y < z_buffer[stripe_x] {
                         for y in draw_start_y..draw_end_y {
                             let row = y * VIEW_WIDTH;
-                            // Add vertical detail stripe pattern
                             if (stripe_x + y) % 2 == 0 {
                                 framebuf[row + stripe_x] = shaded_sprite;
                             }
@@ -637,10 +684,24 @@ async fn main(_spawner: Spawner) {
             ammo_buf[1] = b'0' + (num % 10) as u8;
             let ammo_str = core::str::from_utf8(&ammo_buf).unwrap_or(" 050");
 
-            let _ = Text::with_baseline("AMMO",   Point::new(3,  ty), hud_text_style, Baseline::Top).draw(&mut hud_offscreen);
-            let _ = Text::with_baseline(ammo_str, Point::new(3,  vy), hud_val_style,  Baseline::Top).draw(&mut hud_offscreen);
-            let _ = Text::with_baseline("HEALTH", Point::new(52, ty), hud_text_style, Baseline::Top).draw(&mut hud_offscreen);
-            let _ = Text::with_baseline(" 100%", Point::new(52, vy), hud_val_style,  Baseline::Top).draw(&mut hud_offscreen);
+            let mut health_buf = [b' '; 5];
+            let mut h_num = health_count;
+            health_buf[4] = b'%';
+            health_buf[3] = b'0' + (h_num % 10) as u8; h_num /= 10;
+            health_buf[2] = b'0' + (h_num % 10) as u8; h_num /= 10;
+            health_buf[1] = b'0' + (h_num % 10) as u8;
+            let health_str = core::str::from_utf8(&health_buf).unwrap_or(" 100%");
+
+            let val_style = if pickup_flash_counter > 0 {
+                MonoTextStyle::new(&FONT_6X10, Rgb565::WHITE)
+            } else {
+                hud_val_style
+            };
+
+            let _ = Text::with_baseline("AMMO",     Point::new(3,  ty), hud_text_style, Baseline::Top).draw(&mut hud_offscreen);
+            let _ = Text::with_baseline(ammo_str,   Point::new(3,  vy), val_style,      Baseline::Top).draw(&mut hud_offscreen);
+            let _ = Text::with_baseline("HEALTH",   Point::new(52, ty), hud_text_style, Baseline::Top).draw(&mut hud_offscreen);
+            let _ = Text::with_baseline(health_str, Point::new(52, vy), val_style,      Baseline::Top).draw(&mut hud_offscreen);
         }
 
         // B. DOOM Guy Face — centered at x=106 (face 28px wide)
