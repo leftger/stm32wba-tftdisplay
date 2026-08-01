@@ -208,6 +208,7 @@ async fn main(_spawner: Spawner) {
 
     let mut display = Builder::new(ILI9341Rgb565, di)
         .reset_pin(rst)
+        .color_order(mipidsi::options::ColorOrder::Bgr)
         .orientation(Orientation::new().rotate(Rotation::Deg0).flip_horizontal())
         .init(&mut embassy_time::Delay)
         .unwrap();
@@ -254,6 +255,9 @@ async fn main(_spawner: Spawner) {
     let mut last_touch_y: u16 = 0;
     let mut touch_hold_counter: u8 = 0;
 
+    let mut ammo_count: u16 = 50;
+    let mut muzzle_flash_counter: u8 = 0;
+
     let mut ticker = Ticker::every(Duration::from_millis(16)); // Target 60 FPS
 
     loop {
@@ -278,6 +282,7 @@ async fn main(_spawner: Spawner) {
         let mut b2_pressed = btn2.is_low(); // B2 (Center): Move Forward
         let mut b3_pressed = btn3.is_low(); // B3 (Rightmost): Turn Left
         let mut move_backward = false;
+        let mut shoot_pressed = false;
 
         // FT6236 Touch Controller Polling with Hold Debounce & LiftUp Event Handling
         if touch_int.is_low() || touch_hold_counter > 0 {
@@ -301,9 +306,11 @@ async fn main(_spawner: Spawner) {
                 } else if last_touch_x > 160 {
                     b1_pressed = true; // Right third: Turn Right
                 } else {
-                    // Middle third split: top half = Backward, bottom half = Forward
-                    if last_touch_y < 160 {
+                    // Middle third split into vertical THIRDS (0..106: Backward, 106..213: SHOOT, 213..320: Forward)
+                    if last_touch_y < 106 {
                         move_backward = true;
+                    } else if last_touch_y < 213 {
+                        shoot_pressed = true;
                     } else {
                         b2_pressed = true;
                     }
@@ -311,7 +318,16 @@ async fn main(_spawner: Spawner) {
             }
         }
 
-        if b1_pressed || b2_pressed || b3_pressed || move_backward {
+        if shoot_pressed && muzzle_flash_counter == 0 {
+            if ammo_count > 0 {
+                ammo_count -= 1;
+                muzzle_flash_counter = 4; // Flash for 4 frames
+            }
+        } else if muzzle_flash_counter > 0 {
+            muzzle_flash_counter -= 1;
+        }
+
+        if b1_pressed || b2_pressed || b3_pressed || move_backward || shoot_pressed {
             manual_mode_timer = 300; // Reset 5-second manual control timeout
 
             if b1_pressed {
@@ -533,23 +549,55 @@ async fn main(_spawner: Spawner) {
         }
 
         // --------------------------------------------------------------------
-        // 4. Render First-Person Weapon at Bottom Center of Viewport
+        // 4. Render Crosshair & First-Person Weapon at Bottom Center
         // --------------------------------------------------------------------
+        // Center Crosshair (+)
+        let cx = 120usize;
+        let cy = 128usize;
+        let crosshair_color = Rgb565::GREEN; // Pure Lime Green (Red=0, Green=63, Blue=0)
+        for offset in 1..=4 {
+            framebuf[cy * VIEW_WIDTH + cx - offset] = crosshair_color;
+            framebuf[cy * VIEW_WIDTH + cx + offset] = crosshair_color;
+            framebuf[(cy - offset) * VIEW_WIDTH + cx] = crosshair_color;
+            framebuf[(cy + offset) * VIEW_WIDTH + cx] = crosshair_color;
+        }
+
+        // Shotgun Barrel & Recoil
+        let weapon_recoil = if muzzle_flash_counter > 0 { 8i32 } else { 0i32 };
         let weapon_bob = (sinf(head_bob_time * 2.0) * 4.0) as i32;
         let weapon_x_center = 120 + (cosf(head_bob_time) * 3.0) as i32;
-        let weapon_y_start = (215 + weapon_bob).clamp(180, 248) as usize;
+        let weapon_y_start = (215 + weapon_bob + weapon_recoil).clamp(180, 248) as usize;
 
         let gun_metal = Rgb565::new(12, 14, 16);
-        let gun_dark = Rgb565::new(5, 5, 5);
+        let gun_dark  = Rgb565::new(5, 5, 5);
 
         for wy in weapon_y_start..VIEW3D_HEIGHT {
             let row = wy * VIEW_WIDTH;
             let width_at_y = 12 + ((wy - weapon_y_start) / 2) as i32;
             let wx_start = (weapon_x_center - width_at_y).clamp(0, 239) as usize;
-            let wx_end = (weapon_x_center + width_at_y).clamp(0, 239) as usize;
+            let wx_end   = (weapon_x_center + width_at_y).clamp(0, 239) as usize;
 
             for wx in wx_start..wx_end {
                 framebuf[row + wx] = if wx % 3 == 0 { gun_dark } else { gun_metal };
+            }
+        }
+
+        // Explosive Muzzle Flash Flare when firing!
+        if muzzle_flash_counter > 0 {
+            let flash_center_x = weapon_x_center as usize;
+            let flash_center_y = (weapon_y_start - 12).clamp(150, 220);
+            let flash_yellow = Rgb565::YELLOW;
+            let flash_orange = Rgb565::new(31, 32, 0);
+
+            for dy in 0..16usize {
+                let fy = flash_center_y + dy;
+                if fy < VIEW3D_HEIGHT {
+                    let row = fy * VIEW_WIDTH;
+                    let radius = (8 - (dy as i32 - 8).abs()) as usize;
+                    let fx_start = flash_center_x.saturating_sub(radius);
+                    let fx_end   = (flash_center_x + radius).min(239);
+                    framebuf[row + fx_start..=row + fx_end].fill(if dy % 2 == 0 { flash_yellow } else { flash_orange });
+                }
             }
         }
 
@@ -573,7 +621,7 @@ async fn main(_spawner: Spawner) {
         // Top HUD border line
         framebuf[HUD_Y * VIEW_WIDTH..(HUD_Y + 1) * VIEW_WIDTH].fill(hud_border);
 
-        // A. AMMO (x=3) & HEALTH (x=55) — left side
+        // A. AMMO (x=3) & HEALTH (x=52) — left side
         {
             let mut hud_offscreen = OffscreenBuffer {
                 pixels: framebuf,
@@ -581,8 +629,16 @@ async fn main(_spawner: Spawner) {
             };
             let ty = (HUD_Y + 6) as i32;
             let vy = (HUD_Y + 20) as i32;
+
+            let mut ammo_buf = [b' '; 4];
+            let mut num = ammo_count;
+            ammo_buf[3] = b'0' + (num % 10) as u8; num /= 10;
+            ammo_buf[2] = b'0' + (num % 10) as u8; num /= 10;
+            ammo_buf[1] = b'0' + (num % 10) as u8;
+            let ammo_str = core::str::from_utf8(&ammo_buf).unwrap_or(" 050");
+
             let _ = Text::with_baseline("AMMO",   Point::new(3,  ty), hud_text_style, Baseline::Top).draw(&mut hud_offscreen);
-            let _ = Text::with_baseline(" 050",   Point::new(3,  vy), hud_val_style,  Baseline::Top).draw(&mut hud_offscreen);
+            let _ = Text::with_baseline(ammo_str, Point::new(3,  vy), hud_val_style,  Baseline::Top).draw(&mut hud_offscreen);
             let _ = Text::with_baseline("HEALTH", Point::new(52, ty), hud_text_style, Baseline::Top).draw(&mut hud_offscreen);
             let _ = Text::with_baseline(" 100%", Point::new(52, vy), hud_val_style,  Baseline::Top).draw(&mut hud_offscreen);
         }
@@ -597,7 +653,7 @@ async fn main(_spawner: Spawner) {
         }
         let eye_offset = if angle_diff > 0.05 { 2i32 } else if angle_diff < -0.05 { -2 } else { 0 };
         let skin_color  = Rgb565::new(28, 20, 16);
-        let eye_color   = Rgb565::WHITE;
+        let eye_color   = if muzzle_flash_counter > 0 { Rgb565::RED } else { Rgb565::WHITE };
         let pupil_color = Rgb565::BLACK;
         for fy in (face_box_y + 8)..(face_box_y + 44) {
             let row = fy * VIEW_WIDTH;
@@ -611,8 +667,14 @@ async fn main(_spawner: Spawner) {
         let px2 = (face_box_x as i32 + 17 + eye_offset) as usize;
         framebuf[eye_row + px1] = pupil_color;
         framebuf[eye_row + px2] = pupil_color;
+
+        // Grinning teeth when shooting vs normal mouth
         let mouth_row = (face_box_y + 34) * VIEW_WIDTH;
-        framebuf[mouth_row + face_box_x + 8..mouth_row + face_box_x + 20].fill(Rgb565::RED);
+        if muzzle_flash_counter > 0 {
+            framebuf[mouth_row + face_box_x + 8..mouth_row + face_box_x + 20].fill(Rgb565::WHITE);
+        } else {
+            framebuf[mouth_row + face_box_x + 8..mouth_row + face_box_x + 20].fill(Rgb565::RED);
+        }
 
         // C. MODE label — right of face (x=140)
         {

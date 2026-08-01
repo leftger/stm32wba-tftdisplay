@@ -304,6 +304,7 @@ async fn main(_spawner: Spawner) {
 
     let mut display = Builder::new(ILI9341Rgb565, di)
         .reset_pin(rst)
+        .color_order(mipidsi::options::ColorOrder::Bgr)
         .orientation(Orientation::new().rotate(Rotation::Deg90).flip_horizontal())
         .init(&mut embassy_time::Delay)
         .unwrap();
