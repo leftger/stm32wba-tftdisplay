@@ -272,6 +272,7 @@ async fn main(_spawner: Spawner) {
         let mut b1_pressed = btn1.is_low(); // B1 (Leftmost): Turn Right
         let mut b2_pressed = btn2.is_low(); // B2 (Center): Move Forward
         let mut b3_pressed = btn3.is_low(); // B3 (Rightmost): Turn Left
+        let mut move_backward = false;
 
         // FT6236 Touch Controller Polling
         if touch_int.is_low() {
@@ -280,17 +281,22 @@ async fn main(_spawner: Spawner) {
                 let touch_y = pt.y;
                 if touch_x < 240 && touch_y < 320 {
                     if touch_x < 80 {
-                        b3_pressed = true;
+                        b3_pressed = true; // Left third: Turn Left
                     } else if touch_x > 160 {
-                        b1_pressed = true;
+                        b1_pressed = true; // Right third: Turn Right
                     } else {
-                        b2_pressed = true;
+                        // Middle third split: top half = Backward, bottom half = Forward
+                        if touch_y < 160 {
+                            move_backward = true;
+                        } else {
+                            b2_pressed = true;
+                        }
                     }
                 }
             }
         }
 
-        if b1_pressed || b2_pressed || b3_pressed {
+        if b1_pressed || b2_pressed || b3_pressed || move_backward {
             manual_mode_timer = 300; // Reset 5-second manual control timeout
 
             if b1_pressed {
@@ -311,6 +317,15 @@ async fn main(_spawner: Spawner) {
                 if MAP[(next_y as usize) * MAP_SIZE + (pos_x as usize)] == 0 { pos_y = next_y; }
                 if MAP[(pos_y as usize) * MAP_SIZE + (next_x as usize)] == 0 { pos_x = next_x; }
                 head_bob_time += 0.25;
+            }
+            if move_backward {
+                // Move Backward (Reverse direction)
+                let move_speed = 0.06f32;
+                let next_x = pos_x - dir_x * move_speed;
+                let next_y = pos_y - dir_y * move_speed;
+                if MAP[(next_y as usize) * MAP_SIZE + (pos_x as usize)] == 0 { pos_y = next_y; }
+                if MAP[(pos_y as usize) * MAP_SIZE + (next_x as usize)] == 0 { pos_x = next_x; }
+                head_bob_time -= 0.25;
             }
         } else if manual_mode_timer > 0 {
             manual_mode_timer -= 1;
