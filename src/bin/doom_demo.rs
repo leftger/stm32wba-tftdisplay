@@ -216,8 +216,9 @@ async fn main(_spawner: Spawner) {
     let btn2 = Input::new(p.PC5, Pull::Up);  // USER2 Button B2 (Center): Move Forward (PC5)
     let btn3 = Input::new(p.PB4, Pull::Up);  // USER3 Button B3 (Rightmost): Turn Right (PB4)
 
-    // Touch Controller I2C1 Setup (SDA=PB1, SCL=PB2, INT=PE0) using FT6236 driver
-    let i2c_config = I2cConfig::default();
+    // Touch Controller I2C1 Setup (SDA=PB1, SCL=PB2, INT=PE0) using FT6236 driver (400kHz Fast Mode)
+    let mut i2c_config = I2cConfig::default();
+    i2c_config.frequency = Hertz(400_000); // 400kHz Fast Mode I2C
     let mut i2c = I2c::new_blocking(
         p.I2C1,
         p.PB2, // SCL (Arduino D15)
@@ -249,6 +250,10 @@ async fn main(_spawner: Spawner) {
     let mut last_blit_us: u64;
     let mut last_total_ms: u64;
 
+    let mut last_touch_x: u16 = 0;
+    let mut last_touch_y: u16 = 0;
+    let mut touch_hold_counter: u8 = 0;
+
     let mut ticker = Ticker::every(Duration::from_millis(16)); // Target 60 FPS
 
     loop {
@@ -274,23 +279,33 @@ async fn main(_spawner: Spawner) {
         let mut b3_pressed = btn3.is_low(); // B3 (Rightmost): Turn Left
         let mut move_backward = false;
 
-        // FT6236 Touch Controller Polling
-        if touch_int.is_low() {
+        // FT6236 Touch Controller Polling with Hold Debounce & LiftUp Event Handling
+        if touch_int.is_low() || touch_hold_counter > 0 {
             if let Ok(Some(pt)) = touch_dev.get_point0() {
-                let touch_x = pt.x;
-                let touch_y = pt.y;
-                if touch_x < 240 && touch_y < 320 {
-                    if touch_x < 80 {
-                        b3_pressed = true; // Left third: Turn Left
-                    } else if touch_x > 160 {
-                        b1_pressed = true; // Right third: Turn Right
+                if pt.event != ft6236::EventType::LiftUp {
+                    last_touch_x = pt.x;
+                    last_touch_y = pt.y;
+                    touch_hold_counter = 4; // Keep hold active for up to 4 frames (60ms window)
+                } else {
+                    touch_hold_counter = 0; // Immediate release on LiftUp event
+                }
+            } else if touch_hold_counter > 0 {
+                touch_hold_counter -= 1;
+            }
+        }
+
+        if touch_hold_counter > 0 {
+            if last_touch_x < 240 && last_touch_y < 320 {
+                if last_touch_x < 80 {
+                    b3_pressed = true; // Left third: Turn Left
+                } else if last_touch_x > 160 {
+                    b1_pressed = true; // Right third: Turn Right
+                } else {
+                    // Middle third split: top half = Backward, bottom half = Forward
+                    if last_touch_y < 160 {
+                        move_backward = true;
                     } else {
-                        // Middle third split: top half = Backward, bottom half = Forward
-                        if touch_y < 160 {
-                            move_backward = true;
-                        } else {
-                            b2_pressed = true;
-                        }
+                        b2_pressed = true;
                     }
                 }
             }

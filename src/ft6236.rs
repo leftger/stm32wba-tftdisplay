@@ -155,9 +155,39 @@ where
         }
     }
 
-    /// get first touch point
+    /// get first touch point (single-transaction 7-byte burst for sub-millisecond latency)
     pub fn get_point0(&mut self) -> Result<Option<PointEvent>, I2C::Error> {
-        self.get_point(0)
+        let mut buf = [0u8; 7];
+        self.i2c.write_read(self.addr, &[0x02], &mut buf)?;
+
+        let num_touches = buf[0] & 0b11;
+        if num_touches == 0 {
+            return Ok(None);
+        }
+
+        let event = if let Some(event) = EventType::from_u8(buf[1] >> 6) {
+            event
+        } else {
+            return Ok(None);
+        };
+
+        let x = (((buf[1] as u16) & 0b111) << 8) | (buf[2] as u16);
+        let touch_id = buf[3] >> 4;
+        if touch_id == 0x0f {
+            return Ok(None);
+        }
+        let y = (((buf[3] as u16) & 0b111) << 8) | (buf[4] as u16);
+        let weight = buf[5];
+        let area = buf[6] & 0b1111;
+
+        Ok(Some(PointEvent {
+            x,
+            y,
+            event,
+            weight,
+            area,
+            touch_id,
+        }))
     }
 
     /// get second touch point
