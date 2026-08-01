@@ -58,7 +58,8 @@ const VIEW_PIXELS: usize = VIEW_WIDTH * VIEW_HEIGHT;
 struct FrameBuffer([Rgb565; VIEW_PIXELS]);
 struct SafeFrameBuf(UnsafeCell<FrameBuffer>);
 unsafe impl Sync for SafeFrameBuf {}
-static RAW_FRAMEBUF: SafeFrameBuf = SafeFrameBuf(UnsafeCell::new(FrameBuffer([Rgb565::BLACK; VIEW_PIXELS])));
+static RAW_FRAMEBUF_A: SafeFrameBuf = SafeFrameBuf(UnsafeCell::new(FrameBuffer([Rgb565::BLACK; VIEW_PIXELS])));
+static RAW_FRAMEBUF_B: SafeFrameBuf = SafeFrameBuf(UnsafeCell::new(FrameBuffer([Rgb565::BLACK; VIEW_PIXELS])));
 // ----------------------------------------------------------------------------
 // DOOM E1M1-Inspired 16x16 Level Map
 // ----------------------------------------------------------------------------
@@ -128,6 +129,12 @@ fn apply_shade(color: Rgb565, factor: f32) -> Rgb565 {
     let g = ((color.g() as f32) * f) as u8;
     let b = ((color.b() as f32) * f) as u8;
     Rgb565::new(r, g, b)
+}
+
+#[inline(always)]
+fn pack_rgb565_u32(color: Rgb565) -> u32 {
+    let raw = color.into_storage() as u32;
+    (raw << 16) | raw
 }
 
 fn get_wall_color(wall_type: u8, side: u8) -> Rgb565 {
@@ -205,8 +212,8 @@ async fn main(_spawner: Spawner) {
     let btn2 = Input::new(p.PC5, Pull::Up);  // USER2 Button B2 (Center): Move Forward (PC5)
     let btn3 = Input::new(p.PB4, Pull::Up);  // USER3 Button B3 (Rightmost): Turn Right (PB4)
 
-    let framebuf = unsafe { &mut (*RAW_FRAMEBUF.0.get()).0 };
-    framebuf.fill(Rgb565::BLACK);
+    let mut use_buf_a = true;
+
 
     let hud_text_style = MonoTextStyle::new(&FONT_6X10, Rgb565::RED);
     let hud_val_style = MonoTextStyle::new(&FONT_6X10, Rgb565::YELLOW);
@@ -225,12 +232,21 @@ async fn main(_spawner: Spawner) {
     let mut head_bob_time: f32 = 0.0;
     let mut last_raycast_us: u64;
     let mut last_blit_us: u64;
-    let mut last_total_ms: u64 = 16;
+    let mut last_total_ms: u64;
 
     let mut ticker = Ticker::every(Duration::from_millis(16)); // Target 60 FPS
 
     loop {
         let frame_start = Instant::now();
+
+        let framebuf = unsafe {
+            if use_buf_a {
+                &mut (*RAW_FRAMEBUF_A.0.get()).0
+            } else {
+                &mut (*RAW_FRAMEBUF_B.0.get()).0
+            }
+        };
+        use_buf_a = !use_buf_a;
 
         // --------------------------------------------------------------------
         // 1. Physical 3-Button FPS Controls (B1: Left, B2: Forward, B3: Right)
@@ -382,17 +398,29 @@ async fn main(_spawner: Spawner) {
             let ceiling_color = apply_shade(Rgb565::new(3, 6, 12), shade_factor * 0.5);
             let floor_color   = apply_shade(Rgb565::new(8, 6, 4),  shade_factor * 0.6);
 
+            let ceil_u32   = pack_rgb565_u32(ceiling_color);
+            let shaded_u32 = pack_rgb565_u32(shaded_wall);
+            let floor_u32  = pack_rgb565_u32(floor_color);
+
+            let framebuf_u32 = unsafe {
+                core::slice::from_raw_parts_mut(framebuf.as_mut_ptr() as *mut u32, VIEW_PIXELS / 2)
+            };
+
+            let x_u32 = x / 2;
             for y in 0..draw_start {
-                let row = y * VIEW_WIDTH;
-                framebuf[row + x..row + x + 4].fill(ceiling_color);
+                let idx = y * 120 + x_u32;
+                framebuf_u32[idx]     = ceil_u32;
+                framebuf_u32[idx + 1] = ceil_u32;
             }
             for y in draw_start..=draw_end {
-                let row = y * VIEW_WIDTH;
-                framebuf[row + x..row + x + 4].fill(shaded_wall);
+                let idx = y * 120 + x_u32;
+                framebuf_u32[idx]     = shaded_u32;
+                framebuf_u32[idx + 1] = shaded_u32;
             }
             for y in (draw_end + 1)..VIEW3D_HEIGHT {
-                let row = y * VIEW_WIDTH;
-                framebuf[row + x..row + x + 4].fill(floor_color);
+                let idx = y * 120 + x_u32;
+                framebuf_u32[idx]     = floor_u32;
+                framebuf_u32[idx + 1] = floor_u32;
             }
         }
 
@@ -471,10 +499,14 @@ async fn main(_spawner: Spawner) {
         let hud_border = Rgb565::RED;
         const HUD_Y: usize = VIEW3D_HEIGHT; // 256
 
-        // Fill HUD background area
+        // Fill HUD background area using 32-bit word fills
+        let hud_bg_u32 = pack_rgb565_u32(hud_bg);
+        let framebuf_u32 = unsafe {
+            core::slice::from_raw_parts_mut(framebuf.as_mut_ptr() as *mut u32, VIEW_PIXELS / 2)
+        };
         for y in HUD_Y..VIEW_HEIGHT {
-            let row = y * VIEW_WIDTH;
-            framebuf[row..row + VIEW_WIDTH].fill(hud_bg);
+            let row_u32 = y * 120;
+            framebuf_u32[row_u32..row_u32 + 120].fill(hud_bg_u32);
         }
         // Top HUD border line
         framebuf[HUD_Y * VIEW_WIDTH..(HUD_Y + 1) * VIEW_WIDTH].fill(hud_border);
