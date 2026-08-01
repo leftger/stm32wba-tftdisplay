@@ -164,35 +164,35 @@ fn pack_rgb565_u32(color: Rgb565) -> u32 {
 #[inline(always)]
 fn get_wall_texture_pixel(tile: u8, tex_x: usize, tex_y: usize, side: u8) -> Rgb565 {
     let base = match tile {
-        1 => { // Red/Brown Brick Wall
+        1 => { // Earthy Tan/Brown Brick Wall (Zero Purple Tint)
             let is_mortar = (tex_y % 4 == 0)
                 || ((tex_y / 4) % 2 == 0 && tex_x % 8 == 0)
                 || ((tex_y / 4) % 2 == 1 && (tex_x + 4) % 8 == 0);
-            if is_mortar { Rgb565::new(8, 8, 8) } else { Rgb565::new(22, 8, 4) }
+            if is_mortar { Rgb565::new(6, 12, 6) } else { Rgb565::new(18, 14, 2) }
         }
         2 => { // Tech Blue Panel
             if tex_y == 2 || tex_y == 14 || (tex_x == 8 && tex_y > 4 && tex_y < 12) {
-                Rgb565::new(0, 48, 31) // Glowing Cyan/Blue LED
+                Rgb565::new(0, 50, 25) // Glowing Cyan/Blue LED
             } else if tex_x == 0 || tex_x == 15 || tex_y == 0 || tex_y == 15 {
-                Rgb565::new(4, 6, 8) // Dark Steel Frame
+                Rgb565::new(2, 8, 12) // Dark Navy Frame
             } else {
-                Rgb565::new(10, 16, 20) // Tech Plate
+                Rgb565::new(4, 16, 22) // Cool Tech Blue Plate
             }
         }
         3 => { // Hazard Warning Stripe
             if (tex_x + tex_y) % 6 < 3 {
                 Rgb565::YELLOW
             } else {
-                Rgb565::new(3, 3, 3)
+                Rgb565::new(2, 4, 2) // Deep Black
             }
         }
-        _ => { // Reinforced Metal Door
+        _ => { // Reinforced Slate Steel Blast Door
             if tex_x == 0 || tex_x == 15 || tex_y == 0 || tex_y == 15 {
-                Rgb565::new(25, 20, 0) // Brass Frame
+                Rgb565::new(16, 32, 16) // Outer Steel Frame
             } else if tex_x >= 12 && tex_x <= 13 && tex_y >= 7 && tex_y <= 9 {
                 Rgb565::YELLOW // Door Handle
             } else {
-                Rgb565::new(14, 12, 10) // Dark Metal Panel
+                Rgb565::new(10, 20, 10) // Dark Slate Grey Panel
             }
         }
     };
@@ -586,9 +586,95 @@ async fn main(_spawner: Spawner) {
         let plane_y = dir_x * fov_scale;
 
         // --------------------------------------------------------------------
-        // 2. DDA Raycaster Rendering Engine (320x192 Viewport)
+        // 2. Mode 7 True 3D Perspective Floor & Ceiling Raycaster Engine
         // --------------------------------------------------------------------
-        // Process columns 4 pixels wide — halves DDA ray count from 120 to 60
+        let center_y = (VIEW3D_HEIGHT / 2) as i32 + head_bob;
+        let ray_dir_x0 = dir_x + plane_x;
+        let ray_dir_y0 = dir_y + plane_y;
+        let ray_dir_x1 = dir_x - plane_x;
+        let ray_dir_y1 = dir_y - plane_y;
+
+        let framebuf_u32 = unsafe {
+            core::slice::from_raw_parts_mut(framebuf.as_mut_ptr() as *mut u32, VIEW_PIXELS / 2)
+        };
+
+        // A. True Mode 7 Perspective Floor (Vanishing point on horizon)
+        for y in (center_y.clamp(0, VIEW3D_HEIGHT as i32) as usize)..VIEW3D_HEIGHT {
+            let p = (y as i32 - center_y).max(1);
+            let row_dist = (0.5 * VIEW3D_HEIGHT as f32) / (p as f32);
+
+            let floor_step_x = row_dist * (ray_dir_x1 - ray_dir_x0) / (VIEW_WIDTH as f32);
+            let floor_step_y = row_dist * (ray_dir_y1 - ray_dir_y0) / (VIEW_WIDTH as f32);
+
+            let mut floor_x = pos_x + row_dist * ray_dir_x0;
+            let mut floor_y = pos_y + row_dist * ray_dir_y0;
+
+            let f_shade = (1.0 / (1.0 + row_dist * 0.18)).clamp(0.08, 0.85);
+            let row_u32 = y * 120;
+
+            for x_u32 in 0..120 {
+                let cell_x = floor_x as i32;
+                let cell_y = floor_y as i32;
+
+                let tx = ((floor_x - cell_x as f32) * 16.0) as usize & 15;
+                let ty = ((floor_y - cell_y as f32) * 16.0) as usize & 15;
+
+                let is_mortar = (tx == 0) || (ty == 0);
+                let f_base = if is_mortar {
+                    Rgb565::new(4, 3, 2)
+                } else if (cell_x + cell_y) % 2 == 0 {
+                    Rgb565::new(16, 12, 4) // E1M1 Tan Stone Tile A
+                } else {
+                    Rgb565::new(11, 8, 3)  // Dark Stone Tile B
+                };
+
+                framebuf_u32[row_u32 + x_u32] = pack_rgb565_u32(apply_shade(f_base, f_shade));
+
+                floor_x += floor_step_x * 2.0;
+                floor_y += floor_step_y * 2.0;
+            }
+        }
+
+        // B. True Mode 7 Perspective Ceiling (Vanishing point on horizon)
+        for y in 0..(center_y.clamp(0, VIEW3D_HEIGHT as i32) as usize) {
+            let p = (center_y - y as i32).max(1);
+            let row_dist = (0.5 * VIEW3D_HEIGHT as f32) / (p as f32);
+
+            let ceil_step_x = row_dist * (ray_dir_x1 - ray_dir_x0) / (VIEW_WIDTH as f32);
+            let ceil_step_y = row_dist * (ray_dir_y1 - ray_dir_y0) / (VIEW_WIDTH as f32);
+
+            let mut ceil_x = pos_x + row_dist * ray_dir_x0;
+            let mut ceil_y = pos_y + row_dist * ray_dir_y0;
+
+            let c_shade = (1.0 / (1.0 + row_dist * 0.22)).clamp(0.08, 0.7);
+            let row_u32 = y * 120;
+
+            for x_u32 in 0..120 {
+                let cell_x = ceil_x as i32;
+                let cell_y = ceil_y as i32;
+
+                let tx = ((ceil_x - cell_x as f32) * 16.0) as usize & 15;
+                let ty = ((ceil_y - cell_y as f32) * 16.0) as usize & 15;
+
+                let is_beam = (tx == 0) || (ty == 0);
+                let c_base = if is_beam {
+                    Rgb565::new(2, 4, 8)  // Structural Steel Beam
+                } else if (cell_x + cell_y) % 2 == 0 {
+                    Rgb565::new(6, 12, 18) // Tech Ceiling Panel A
+                } else {
+                    Rgb565::new(4, 8, 14)  // Tech Ceiling Panel B
+                };
+
+                framebuf_u32[row_u32 + x_u32] = pack_rgb565_u32(apply_shade(c_base, c_shade));
+
+                ceil_x += ceil_step_x * 2.0;
+                ceil_y += ceil_step_y * 2.0;
+            }
+        }
+
+        // --------------------------------------------------------------------
+        // 2.5 DDA 3D Wall Column Rendering
+        // --------------------------------------------------------------------
         for x in (0..VIEW_WIDTH).step_by(4) {
             // Negate camera_x to compensate for display flip_horizontal() orientation
             let camera_x = -(2.0 * (x as f32) / (VIEW_WIDTH as f32) - 1.0);
@@ -665,23 +751,7 @@ async fn main(_spawner: Spawner) {
             let tex_x = ((wall_x * 16.0) as usize).clamp(0, 15);
 
             let shade_factor = 1.0 / (1.0 + perp_wall_dist * 0.18);
-            let ceiling_color = apply_shade(Rgb565::new(3, 6, 12), shade_factor * 0.5);
-            let floor_color   = apply_shade(Rgb565::new(8, 6, 4),  shade_factor * 0.6);
-
-            let ceil_u32  = pack_rgb565_u32(ceiling_color);
-            let floor_u32 = pack_rgb565_u32(floor_color);
-
-            let framebuf_u32 = unsafe {
-                core::slice::from_raw_parts_mut(framebuf.as_mut_ptr() as *mut u32, VIEW_PIXELS / 2)
-            };
-
             let x_u32 = x / 2;
-            // Ceiling
-            for y in 0..draw_start {
-                let idx = y * 120 + x_u32;
-                framebuf_u32[idx]     = ceil_u32;
-                framebuf_u32[idx + 1] = ceil_u32;
-            }
 
             // Textured 3D Wall Column
             let tex_step = 16.0 / (line_height as f32).max(1.0);
@@ -698,13 +768,6 @@ async fn main(_spawner: Spawner) {
                 let idx = y * 120 + x_u32;
                 framebuf_u32[idx]     = pixel_u32;
                 framebuf_u32[idx + 1] = pixel_u32;
-            }
-
-            // Floor
-            for y in (draw_end + 1)..VIEW3D_HEIGHT {
-                let idx = y * 120 + x_u32;
-                framebuf_u32[idx]     = floor_u32;
-                framebuf_u32[idx + 1] = floor_u32;
             }
         }
 
