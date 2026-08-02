@@ -2,6 +2,7 @@
 #![no_main]
 
 use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicBool, Ordering};
 use defmt_rtt as _;
 use panic_probe as _;
 
@@ -12,6 +13,9 @@ use embassy_stm32::gpio::{Input, Level, Output, Pull, Speed};
 use embassy_stm32::peripherals;
 use embassy_stm32::rcc::*;
 use embassy_stm32::i2c::{Config as I2cConfig, I2c};
+use embassy_stm32::usb::{self, HostDriver};
+use embassy_usb_host::class::hid::HidHost;
+use embassy_usb_host::{BusRoute, BusState};
 #[path = "../ft6236.rs"]
 mod ft6236;
 use ft6236::FT6236;
@@ -40,15 +44,166 @@ use embedded_3dgfx::hud::{FramebufDrawTarget, format_u16_dec};
 bind_interrupts!(struct Irqs {
     GPDMA1_CHANNEL0 => InterruptHandler<peripherals::GPDMA1_CH0>;
     GPDMA1_CHANNEL1 => InterruptHandler<peripherals::GPDMA1_CH1>;
+    USB_OTG_HS => usb::HostInterruptHandler<peripherals::USB_OTG_HS>;
 });
 
+static USB_FORWARD: AtomicBool = AtomicBool::new(false);
+static USB_BACKWARD: AtomicBool = AtomicBool::new(false);
+static USB_LEFT: AtomicBool = AtomicBool::new(false);
+static USB_RIGHT: AtomicBool = AtomicBool::new(false);
+static USB_SHOOT: AtomicBool = AtomicBool::new(false);
+
+#[embassy_executor::task]
+async fn usb_host_task(
+    usb_otg: embassy_stm32::Peri<'static, peripherals::USB_OTG_HS>,
+    pd6: embassy_stm32::Peri<'static, peripherals::PD6>,
+    pd7: embassy_stm32::Peri<'static, peripherals::PD7>,
+) {
+    defmt::info!("Initializing USB host driver...");
+    let driver = HostDriver::new_hs_host(usb_otg, Irqs, pd6, pd7);
+    static BUS_STATE: BusState = BusState::new();
+    let (mut bus_ctrl, bus) = embassy_usb_host::bus(driver, &BUS_STATE);
+    defmt::info!("USB host initialized, waiting for device...");
+
+    loop {
+        let speed = bus_ctrl.wait_for_connection().await;
+        defmt::info!("USB Device connected at speed {:?}", speed);
+
+        let mut config_buf = [0u8; 256];
+        let result = bus.enumerate(BusRoute::Direct(speed), &mut config_buf).await;
+
+        let (enum_info, config_len) = match result {
+            Ok(r) => r,
+            Err(e) => {
+                defmt::error!("USB Enumeration failed: {:?}", e);
+                continue;
+            }
+        };
+
+        defmt::info!(
+            "USB Enumerated: VID={:04x} PID={:04x} addr={}",
+            enum_info.device_desc.vendor_id,
+            enum_info.device_desc.product_id,
+            enum_info.device_address
+        );
+
+        let mut hid = match HidHost::new(&bus, &config_buf[..config_len], &enum_info) {
+            Ok(h) => h,
+            Err(e) => {
+                defmt::error!("HID init failed: {:?}", e);
+                continue;
+            }
+        };
+
+        if let Err(e) = hid.set_idle(0, 0).await {
+            defmt::error!("SET_IDLE failed: {:?}", e);
+            continue;
+        }
+
+        defmt::info!("HID device ready, receiving reports...");
+
+        let mut buf = [0u8; 64];
+        loop {
+            match hid.read(&mut buf).await {
+                Ok(n) if n > 0 => {
+                    defmt::info!("HID report: {:x}", &buf[..n]);
+
+                    // 1. Hardware Gamepad Stream Parsing (from log traces)
+                    // Forward button: buf[17] == 1 || buf[17] == 5
+                    // Back button: buf[20] == 2
+                    // Left button: buf[17] == 7 || buf[13] == 0x80
+                    // Right button: buf[17] == 3
+                    // Trigger (Shoot): buf[19] == 0x80 || buf[20] == 7
+                    if n >= 18 {
+                        let b17 = buf[17];
+                        let b13 = if n >= 14 { buf[13] } else { 0xC0 };
+
+                        let is_fwd = b17 == 1 || b17 == 5;
+                        let is_right = b17 == 3;
+                        let is_left = b17 == 7 || b13 == 0x80;
+
+                        USB_FORWARD.store(is_fwd, Ordering::Relaxed);
+                        USB_RIGHT.store(is_right, Ordering::Relaxed);
+                        USB_LEFT.store(is_left, Ordering::Relaxed);
+                    }
+                    if n >= 20 {
+                        let b19 = buf[19];
+                        let b20 = if n >= 21 { buf[20] } else { 0 };
+
+                        let is_shoot = (b19 & 0x80) != 0 || (b20 & 0x04) != 0 || b20 == 7;
+                        let is_back = (b20 & 0x02) != 0 && b20 != 7;
+
+                        USB_SHOOT.store(is_shoot, Ordering::Relaxed);
+                        USB_BACKWARD.store(is_back, Ordering::Relaxed);
+                    }
+
+                    // 2. Standard 8-byte USB Keyboard report
+                    if n == 8 {
+                        let keys = &buf[2..8];
+                        let mut fwd = false;
+                        let mut back = false;
+                        let mut left = false;
+                        let mut right = false;
+                        let mut shoot = false;
+                        for &k in keys {
+                            match k {
+                                0x1A | 0x52 => fwd = true,   // 'W' or Up Arrow
+                                0x16 | 0x51 => back = true,  // 'S' or Down Arrow
+                                0x04 | 0x50 => left = true,  // 'A' or Left Arrow
+                                0x05 | 0x4F => right = true, // 'D' or Right Arrow
+                                0x2C | 0x28 => shoot = true, // Space or Enter
+                                _ => {}
+                            }
+                        }
+                        USB_FORWARD.store(fwd, Ordering::Relaxed);
+                        USB_BACKWARD.store(back, Ordering::Relaxed);
+                        USB_LEFT.store(left, Ordering::Relaxed);
+                        USB_RIGHT.store(right, Ordering::Relaxed);
+                        USB_SHOOT.store(shoot, Ordering::Relaxed);
+                    }
+
+                    // 3. Standard USB Mouse report (3-6 bytes)
+                    if n >= 3 && n <= 6 {
+                        let buttons = buf[0];
+                        let dx = buf[1] as i8;
+                        USB_SHOOT.store((buttons & 0x01) != 0, Ordering::Relaxed);
+                        USB_FORWARD.store((buttons & 0x02) != 0, Ordering::Relaxed);
+                        if dx < -5 {
+                            USB_LEFT.store(true, Ordering::Relaxed);
+                            USB_RIGHT.store(false, Ordering::Relaxed);
+                        } else if dx > 5 {
+                            USB_RIGHT.store(true, Ordering::Relaxed);
+                            USB_LEFT.store(false, Ordering::Relaxed);
+                        } else {
+                            USB_LEFT.store(false, Ordering::Relaxed);
+                            USB_RIGHT.store(false, Ordering::Relaxed);
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    defmt::error!("HID read failed: {:?}", e);
+                    USB_FORWARD.store(false, Ordering::Relaxed);
+                    USB_BACKWARD.store(false, Ordering::Relaxed);
+                    USB_LEFT.store(false, Ordering::Relaxed);
+                    USB_RIGHT.store(false, Ordering::Relaxed);
+                    USB_SHOOT.store(false, Ordering::Relaxed);
+                    break;
+                }
+            }
+        }
+
+        defmt::info!("Device disconnected, waiting for next...");
+    }
+}
 
 // Microsecond hardware delay for SPI CS timing using Cortex-M asm delay
 struct MicroDelay;
 impl embedded_hal::delay::DelayNs for MicroDelay {
     #[inline(always)]
     fn delay_ns(&mut self, ns: u32) {
-        cortex_m::asm::delay((ns / 10).max(1));
+        let cycles = (ns as u64 * 100) / 1000;
+        cortex_m::asm::delay(cycles as u32);
     }
 }
 
@@ -157,16 +312,16 @@ fn try_move(pos_x: &mut f32, pos_y: &mut f32, dx: f32, dy: f32, map: &[u8], map_
 }
 
 #[embassy_executor::main]
-async fn main(_spawner: Spawner) {
-    // 1. High-Performance MCU Clock Setup (100 MHz SYSCLK + 100 MHz APB1 for 50 MHz SPI)
+async fn main(spawner: Spawner) {
+    // 1. High-Performance MCU Clock Setup (96 MHz SYSCLK + 48 MHz USB Host Clock)
     let mut config = Config::default();
     config.rcc.pll1 = Some(Pll {
         source: PllSource::Hsi,
-        prediv: PllPreDiv::Div1,
-        mul: PllMul::Mul25,
-        divp: Some(PllDiv::Div25),
-        divq: None,
-        divr: Some(PllDiv::Div4), // 100 MHz
+        prediv: PllPreDiv::Div1,   // PLLM = 1 → HSI / 1 = 16 MHz
+        mul: PllMul::Mul30,        // PLLN = 30 → 16 MHz * 30 = 480 MHz VCO
+        divr: Some(PllDiv::Div5),  // PLLR = 5 → 96 MHz (Sysclk)
+        divq: Some(PllDiv::Div10), // PLLQ = 10 → 48 MHz
+        divp: Some(PllDiv::Div30), // PLLP = 30 → 16 MHz (USB_OTG_HS)
         frac: Some(0),
     });
     config.rcc.sys = Sysclk::Pll1R;
@@ -174,13 +329,17 @@ async fn main(_spawner: Spawner) {
     config.rcc.apb1_pre = APBPrescaler::Div1;
     config.rcc.apb2_pre = APBPrescaler::Div1;
     config.rcc.voltage_scale = VoltageScale::Range1;
+    config.rcc.mux.otghssel = mux::Otghssel::Pll1P;
     config.enable_debug_during_sleep = true;
     let p = embassy_stm32::init(config);
 
     defmt::info!("============================================");
     defmt::info!("DOOM E1M1-Inspired 3D Level Walkthrough Demo");
-    defmt::info!("Engine: DDA Fast Raycaster + 25MHz SPI DMA + DOOM HUD");
+    defmt::info!("Engine: DDA Fast Raycaster + 25MHz SPI DMA + USB Host HID");
     defmt::info!("============================================");
+
+    // Spawn USB Host background task
+    spawner.spawn(usb_host_task(p.USB_OTG_HS, p.PD6, p.PD7).expect("Failed to spawn USB host task"));
 
     let mut spi_config = SpiConfig::default();
     spi_config.frequency = Hertz(33_333_333); // High-speed 33.3 MHz SPI bus
@@ -291,11 +450,17 @@ async fn main(_spawner: Spawner) {
         let plane_x = -dir_y * fov_scale;
         let plane_y = dir_x * fov_scale;
 
-        let mut b1_pressed = btn1.is_low(); // B1 (Leftmost): Turn Right
-        let mut b2_pressed = btn2.is_low(); // B2 (Center): Move Forward
-        let mut b3_pressed = btn3.is_low(); // B3 (Rightmost): Turn Left
-        let mut move_backward = false;
-        let mut shoot_pressed = false;
+        let usb_forward = USB_FORWARD.load(Ordering::Relaxed);
+        let usb_backward = USB_BACKWARD.load(Ordering::Relaxed);
+        let usb_left = USB_LEFT.load(Ordering::Relaxed);
+        let usb_right = USB_RIGHT.load(Ordering::Relaxed);
+        let usb_shoot = USB_SHOOT.load(Ordering::Relaxed);
+
+        let mut b1_pressed = btn1.is_low() || usb_right; // B1 (Leftmost): Turn Right
+        let mut b2_pressed = btn2.is_low() || usb_forward; // B2 (Center): Move Forward
+        let mut b3_pressed = btn3.is_low() || usb_left;  // B3 (Rightmost): Turn Left
+        let mut move_backward = usb_backward;
+        let mut shoot_pressed = usb_shoot;
 
         // FT6236 Touch Controller Polling with Hold Debounce & LiftUp Event Handling
         if touch_int.is_low() || touch_hold_counter > 0 {

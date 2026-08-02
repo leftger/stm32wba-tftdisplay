@@ -13,9 +13,10 @@ path = "src/bin/doom_demo.rs"
 
 
 [dependencies]
-embassy-stm32 = { path = "../../embassy-project/embassy/embassy-stm32", features = ["stm32wba65ri", "memory-x", "time-driver-any"] }
+embassy-stm32 = { path = "../../embassy-project/embassy/embassy-stm32", features = ["stm32wba65ri", "memory-x", "time-driver-any", "usb-host", "exti"] }
 embassy-executor = { path = "../../embassy-project/embassy/embassy-executor", features = ["platform-cortex-m", "executor-thread", "defmt"] }
 embassy-time = { path = "../../embassy-project/embassy/embassy-time", features = ["defmt", "defmt-timestamp-uptime"] }
+embassy-usb-host = { path = "../../embassy-project/embassy/embassy-usb-host", features = ["defmt"] }
 
 cortex-m = { version = "0.7.7", features = ["critical-section-single-core"] }
 cortex-m-rt = "0.7.5"
