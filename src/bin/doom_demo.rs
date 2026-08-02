@@ -383,15 +383,15 @@ fn try_move(pos_x: &mut f32, pos_y: &mut f32, dx: f32, dy: f32, map: &[u8], map_
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    // 1. High-Performance MCU Clock Setup (100 MHz SYSCLK)
+    // 1. High-Performance MCU Clock Setup (96 MHz SYSCLK + 48 MHz USB Host Clock)
     let mut config = Config::default();
     config.rcc.pll1 = Some(Pll {
         source: PllSource::Hsi,
-        prediv: PllPreDiv::Div1,
-        mul: PllMul::Mul25,
-        divp: Some(PllDiv::Div25),
-        divq: None,
-        divr: Some(PllDiv::Div4), // 100 MHz
+        prediv: PllPreDiv::Div1,   // PLLM = 1 → HSI / 1 = 16 MHz
+        mul: PllMul::Mul30,        // PLLN = 30 → 16 MHz * 30 = 480 MHz VCO
+        divr: Some(PllDiv::Div5),  // PLLR = 5 → 96 MHz (Sysclk)
+        divq: Some(PllDiv::Div10), // PLLQ = 10 → 48 MHz
+        divp: Some(PllDiv::Div30), // PLLP = 30 → 16 MHz (USB_OTG_HS)
         frac: Some(0),
     });
     config.rcc.sys = Sysclk::Pll1R;
@@ -399,6 +399,7 @@ async fn main(spawner: Spawner) {
     config.rcc.apb1_pre = APBPrescaler::Div1;
     config.rcc.apb2_pre = APBPrescaler::Div1;
     config.rcc.voltage_scale = VoltageScale::Range1;
+    config.rcc.mux.otghssel = mux::Otghssel::Pll1P;
     config.enable_debug_during_sleep = true;
     let p = embassy_stm32::init(config);
 
@@ -407,9 +408,9 @@ async fn main(spawner: Spawner) {
     defmt::info!("Engine: DDA Fast Raycaster + 25MHz SPI DMA + USB Host HID");
     defmt::info!("============================================");
 
-    // Temporarily disabled USB Host background task to isolate debug probe issue
-    // spawner
-    //     .spawn(usb_host_task(p.USB_OTG_HS, p.PD6, p.PD7).expect("Failed to spawn USB host task"));
+    // Spawn USB Host background task
+    spawner
+        .spawn(usb_host_task(p.USB_OTG_HS, p.PD6, p.PD7).expect("Failed to spawn USB host task"));
 
     defmt::info!("Step 1: Setting up SPI...");
     let mut spi_config = SpiConfig::default();
