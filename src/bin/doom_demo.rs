@@ -383,15 +383,15 @@ fn try_move(pos_x: &mut f32, pos_y: &mut f32, dx: f32, dy: f32, map: &[u8], map_
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    // 1. High-Performance MCU Clock Setup (96 MHz SYSCLK + 48 MHz USB Host Clock)
+    // 1. High-Performance MCU Clock Setup (100 MHz SYSCLK)
     let mut config = Config::default();
     config.rcc.pll1 = Some(Pll {
         source: PllSource::Hsi,
-        prediv: PllPreDiv::Div1,   // PLLM = 1 → HSI / 1 = 16 MHz
-        mul: PllMul::Mul30,        // PLLN = 30 → 16 MHz * 30 = 480 MHz VCO
-        divr: Some(PllDiv::Div5),  // PLLR = 5 → 96 MHz (Sysclk)
-        divq: Some(PllDiv::Div10), // PLLQ = 10 → 48 MHz
-        divp: Some(PllDiv::Div30), // PLLP = 30 → 16 MHz (USB_OTG_HS)
+        prediv: PllPreDiv::Div1,
+        mul: PllMul::Mul25,
+        divp: Some(PllDiv::Div25),
+        divq: None,
+        divr: Some(PllDiv::Div4), // 100 MHz
         frac: Some(0),
     });
     config.rcc.sys = Sysclk::Pll1R;
@@ -399,7 +399,6 @@ async fn main(spawner: Spawner) {
     config.rcc.apb1_pre = APBPrescaler::Div1;
     config.rcc.apb2_pre = APBPrescaler::Div1;
     config.rcc.voltage_scale = VoltageScale::Range1;
-    config.rcc.mux.otghssel = mux::Otghssel::Pll1P;
     config.enable_debug_during_sleep = true;
     let p = embassy_stm32::init(config);
 
@@ -412,8 +411,9 @@ async fn main(spawner: Spawner) {
     // spawner
     //     .spawn(usb_host_task(p.USB_OTG_HS, p.PD6, p.PD7).expect("Failed to spawn USB host task"));
 
+    defmt::info!("Step 1: Setting up SPI...");
     let mut spi_config = SpiConfig::default();
-    spi_config.frequency = Hertz(25_000_000); // High-speed 33.3 MHz SPI bus
+    spi_config.frequency = Hertz(25_000_000); // High-speed 25 MHz SPI bus
 
     let spi = Spi::new(
         p.SPI2,
@@ -434,6 +434,7 @@ async fn main(spawner: Spawner) {
     let spi_device = ExclusiveDevice::new(spi, cs, MicroDelay).unwrap();
     let di = SpiInterface::new(spi_device, dc, tx_buf.as_mut_slice());
 
+    defmt::info!("Step 2: Initializing ILI9341 Display...");
     let mut display = Builder::new(ILI9341Rgb565, di)
         .reset_pin(rst)
         .color_order(mipidsi::options::ColorOrder::Bgr)
@@ -441,10 +442,12 @@ async fn main(spawner: Spawner) {
         .init(&mut embassy_time::Delay)
         .unwrap();
 
+    defmt::info!("Step 3: Initializing Buttons...");
     let btn1 = Input::new(p.PC13, Pull::Up); // USER1 Button B1 (Leftmost): Turn Left (PC13)
     let btn2 = Input::new(p.PC5, Pull::Up); // USER2 Button B2 (Center): Move Forward (PC5)
     let btn3 = Input::new(p.PB4, Pull::Up); // USER3 Button B3 (Rightmost): Turn Right (PB4)
 
+    defmt::info!("Step 4: Initializing Touch I2C...");
     // Touch Controller I2C1 Setup (SDA=PB1, SCL=PB2, INT=PE0) using FT6236 driver (400kHz Fast Mode)
     let mut i2c_config = I2cConfig::default();
     i2c_config.frequency = Hertz(400_000); // 400kHz Fast Mode I2C
@@ -455,6 +458,8 @@ async fn main(spawner: Spawner) {
     );
     let touch_int = Input::new(p.PE0, Pull::Up); // T_IRQ (Arduino D2)
     let mut touch_dev = FT6236::new(&mut i2c);
+
+    defmt::info!("Step 5: Setup complete. Entering frame loop...");
 
     let mut use_buf_a = true;
 
@@ -1301,16 +1306,14 @@ async fn main(spawner: Spawner) {
         last_total_ms = frame_start.elapsed().as_millis();
         frame_count += 1;
 
-        if frame_count % 60 == 0 {
-            defmt::info!(
-                "DOOM Demo Frame {}: Total {}ms (Raycast: {}us, DMA Blit: {}us, FPS: {})",
-                frame_count,
-                last_total_ms,
-                last_raycast_us,
-                last_blit_us,
-                1000 / last_total_ms.max(1)
-            );
-        }
+        defmt::info!(
+            "DOOM Frame {}: Total {}ms (3D: {}us, DMA Blit: {}us, FPS: {})",
+            frame_count,
+            last_total_ms,
+            last_raycast_us,
+            last_blit_us,
+            1000 / last_total_ms.max(1)
+        );
 
         ticker.next().await;
     }
