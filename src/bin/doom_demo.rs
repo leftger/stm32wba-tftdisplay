@@ -39,12 +39,14 @@ bind_interrupts!(struct Irqs {
     GPDMA1_CHANNEL1 => InterruptHandler<peripherals::GPDMA1_CH1>;
 });
 
-// Zero-overhead CS delay — embassy_time::Delay rounds to ~1ms per tick which
-// adds ~38ms waste for 38 tx_buffer flushes. NoDelay relies on SPI peripheral
-// hardware timing which is already in the nanosecond range.
-struct NoDelay;
-impl embedded_hal::delay::DelayNs for NoDelay {
-    fn delay_ns(&mut self, _ns: u32) {}
+
+// Microsecond hardware delay for SPI CS timing using Cortex-M asm delay
+struct MicroDelay;
+impl embedded_hal::delay::DelayNs for MicroDelay {
+    #[inline(always)]
+    fn delay_ns(&mut self, ns: u32) {
+        cortex_m::asm::delay((ns / 10).max(1));
+    }
 }
 
 // 32KB static TX buffer — keeps SPI DMA chunking to 5 transactions instead
@@ -144,12 +146,12 @@ struct Fireball {
 // Color Utilities & Shading
 // ----------------------------------------------------------------------------
 #[inline(always)]
-fn apply_shade(color: Rgb565, factor: f32) -> Rgb565 {
-    let f = factor.clamp(0.05, 1.0);
-    let r = ((color.r() as f32) * f) as u8;
-    let g = ((color.g() as f32) * f) as u8;
-    let b = ((color.b() as f32) * f) as u8;
-    Rgb565::new(r, g, b)
+fn apply_shade_fast(color: Rgb565, shade_q8: u32) -> Rgb565 {
+    let raw = color.into_storage() as u32;
+    let r = ((((raw >> 11) & 0x1F) * shade_q8) >> 8).min(31);
+    let g = ((((raw >> 5) & 0x3F) * shade_q8) >> 8).min(63);
+    let b = (((raw & 0x1F) * shade_q8) >> 8).min(31);
+    Rgb565::new(r as u8, g as u8, b as u8)
 }
 
 #[inline(always)]
@@ -158,12 +160,64 @@ fn pack_rgb565_u32(color: Rgb565) -> u32 {
     (raw << 16) | raw
 }
 
+#[inline(always)]
+fn render_floor_and_ceiling_fast(
+    pos_x: f32,
+    pos_y: f32,
+    dir_x: f32,
+    dir_y: f32,
+    plane_x: f32,
+    plane_y: f32,
+    head_bob: i32,
+    framebuf_u32: &mut [u32],
+) {
+    let horizon = (VIEW3D_HEIGHT / 2) as i32 + head_bob;
+
+    let floor_a_u32   = pack_rgb565_u32(Rgb565::new(16, 12, 4));
+    let floor_b_u32   = pack_rgb565_u32(Rgb565::new(11, 8, 3));
+    let ceiling_a_u32 = pack_rgb565_u32(Rgb565::new(6, 12, 18));
+    let ceiling_b_u32 = pack_rgb565_u32(Rgb565::new(4, 8, 14));
+
+    let fov_inv = 2.0 / (VIEW_WIDTH as f32);
+
+    for y in 0..VIEW3D_HEIGHT {
+        let p = (y as i32 - horizon) as f32;
+        if p == 0.0 { continue; }
+
+        let is_floor = p > 0.0;
+        let row_distance = if is_floor { 160.0 / p } else { 160.0 / -p };
+
+        let step_x = -row_distance * (plane_x * fov_inv) * 2.0;
+        let step_y = -row_distance * (plane_y * fov_inv) * 2.0;
+
+        let mut curr_x = pos_x + row_distance * (dir_x + plane_x);
+        let mut curr_y = pos_y + row_distance * (dir_y + plane_y);
+
+        let row_u32 = y * 120;
+        let (col_a, col_b) = if is_floor {
+            (floor_a_u32, floor_b_u32)
+        } else {
+            (ceiling_a_u32, ceiling_b_u32)
+        };
+
+        for x2 in 0..120 {
+            let tx = (curr_x as usize) & 1;
+            let ty = (curr_y as usize) & 1;
+            let pixel_u32 = if (tx ^ ty) == 0 { col_a } else { col_b };
+
+            framebuf_u32[row_u32 + x2] = pixel_u32;
+            curr_x += step_x;
+            curr_y += step_y;
+        }
+    }
+}
+
 // ----------------------------------------------------------------------------
 // Authentic 1993 DOOM Wall Texture Generator (16x16 Bitmapped Patterns)
 // ----------------------------------------------------------------------------
 #[inline(always)]
-fn get_wall_texture_pixel(tile: u8, tex_x: usize, tex_y: usize, side: u8) -> Rgb565 {
-    let base = match tile {
+fn get_wall_texture_pixel_raw(tile: u8, tex_x: usize, tex_y: usize) -> Rgb565 {
+    match tile {
         1 => { // Earthy Tan/Brown Brick Wall (Zero Purple Tint)
             let is_mortar = (tex_y % 4 == 0)
                 || ((tex_y / 4) % 2 == 0 && tex_x % 8 == 0)
@@ -195,12 +249,6 @@ fn get_wall_texture_pixel(tile: u8, tex_x: usize, tex_y: usize, side: u8) -> Rgb
                 Rgb565::new(10, 20, 10) // Dark Slate Grey Panel
             }
         }
-    };
-    if side == 1 {
-        // Dim EW walls slightly for fake directional lighting
-        apply_shade(base, 0.7)
-    } else {
-        base
     }
 }
 
@@ -222,6 +270,7 @@ async fn main(_spawner: Spawner) {
     config.rcc.apb1_pre = APBPrescaler::Div1;
     config.rcc.apb2_pre = APBPrescaler::Div1;
     config.rcc.voltage_scale = VoltageScale::Range1;
+    config.enable_debug_during_sleep = true;
     let p = embassy_stm32::init(config);
 
     defmt::info!("============================================");
@@ -230,7 +279,7 @@ async fn main(_spawner: Spawner) {
     defmt::info!("============================================");
 
     let mut spi_config = SpiConfig::default();
-    spi_config.frequency = Hertz(25_000_000); // Rock-solid 25 MHz SPI bus
+    spi_config.frequency = Hertz(33_333_333); // High-speed 33.3 MHz SPI bus
 
     let spi = Spi::new(
         p.SPI2,
@@ -248,7 +297,7 @@ async fn main(_spawner: Spawner) {
     let rst = Output::new(p.PA10, Level::High, Speed::VeryHigh);
 
     let tx_buf = unsafe { &mut (*RAW_TX_BUF.0.get()).0 };
-    let spi_device = ExclusiveDevice::new(spi, cs, NoDelay).unwrap();
+    let spi_device = ExclusiveDevice::new(spi, cs, MicroDelay).unwrap();
     let di = SpiInterface::new(spi_device, dc, tx_buf.as_mut_slice());
 
     let mut display = Builder::new(ILI9341Rgb565, di)
@@ -593,16 +642,14 @@ async fn main(_spawner: Spawner) {
             core::slice::from_raw_parts_mut(framebuf.as_mut_ptr() as *mut u32, VIEW_PIXELS / 2)
         };
 
-        let mode7_renderer = embedded_3dgfx::raycast::Mode7Renderer::new(VIEW_WIDTH, VIEW3D_HEIGHT);
-        mode7_renderer.render_floor_and_ceiling(
+        render_floor_and_ceiling_fast(
             pos_x,
             pos_y,
-            angle,
+            dir_x,
+            dir_y,
+            plane_x,
+            plane_y,
             head_bob,
-            Rgb565::new(16, 12, 4), // E1M1 Tan Stone Tile A
-            Rgb565::new(11, 8, 3),  // Dark Stone Tile B
-            Rgb565::new(6, 12, 18), // Tech Ceiling Panel A
-            Rgb565::new(4, 8, 14),  // Tech Ceiling Panel B
             framebuf_u32,
         );
 
@@ -618,8 +665,8 @@ async fn main(_spawner: Spawner) {
             let mut map_x = pos_x as i32;
             let mut map_y = pos_y as i32;
 
-            let delta_dist_x = if ray_dir_x == 0.0 { 1e30 } else { libm::fabsf(1.0 / ray_dir_x) };
-            let delta_dist_y = if ray_dir_y == 0.0 { 1e30 } else { libm::fabsf(1.0 / ray_dir_y) };
+            let delta_dist_x = if ray_dir_x == 0.0 { 1e30 } else { (1.0 / ray_dir_x).abs() };
+            let delta_dist_y = if ray_dir_y == 0.0 { 1e30 } else { (1.0 / ray_dir_y).abs() };
 
             let (step_x, mut side_dist_x) = if ray_dir_x < 0.0 {
                 (-1, (pos_x - map_x as f32) * delta_dist_x)
@@ -681,10 +728,12 @@ async fn main(_spawner: Spawner) {
             } else {
                 pos_x + perp_wall_dist * ray_dir_x
             };
-            wall_x -= libm::floorf(wall_x);
+            wall_x -= (wall_x as i32) as f32;
             let tex_x = ((wall_x * 16.0) as usize).clamp(0, 15);
 
-            let shade_factor = 1.0 / (1.0 + perp_wall_dist * 0.18);
+            let base_shade = 1.0 / (1.0 + perp_wall_dist * 0.18);
+            let effective_shade = if side == 1 { base_shade * 0.7 } else { base_shade };
+            let shade_q8 = (effective_shade.clamp(0.05, 1.0) * 256.0) as u32;
             let x_u32 = x / 2;
 
             // Textured 3D Wall Column
@@ -695,8 +744,8 @@ async fn main(_spawner: Spawner) {
                 let tex_y = (tex_pos as usize) & 15;
                 tex_pos += tex_step;
 
-                let tex_color = get_wall_texture_pixel(hit_wall, tex_x, tex_y, side);
-                let shaded_pixel = apply_shade(tex_color, shade_factor);
+                let tex_color = get_wall_texture_pixel_raw(hit_wall, tex_x, tex_y);
+                let shaded_pixel = apply_shade_fast(tex_color, shade_q8);
                 let pixel_u32 = pack_rgb565_u32(shaded_pixel);
 
                 let idx = y * 120 + x_u32;
@@ -740,7 +789,8 @@ async fn main(_spawner: Spawner) {
                         _ => Rgb565::new(0, 36, 31),           // Steel Blue Ammo Crate
                     }
                 };
-                let shaded_sprite = apply_shade(base_color, 1.0 / (1.0 + transform_y * 0.2));
+                let shade_q8 = ((1.0 / (1.0 + transform_y * 0.2)).clamp(0.05, 1.0) * 256.0) as u32;
+                let shaded_sprite = apply_shade_fast(base_color, shade_q8);
 
                 for stripe_x in draw_start_x..draw_end_x {
                     if transform_y < z_buffer[stripe_x] {
@@ -1052,12 +1102,29 @@ async fn main(_spawner: Spawner) {
         last_raycast_us = raycast_start.elapsed().as_micros();
 
         // --------------------------------------------------------------------
-        // 6. Full-Screen SPI DMA Blit (NoDelay + 32KB tx_buffer = ~5 transactions)
+        // 6. Optimized Partial SPI DMA Blit (3D Viewport + HUD On-Demand)
         // --------------------------------------------------------------------
         let blit_start = Instant::now();
 
-        let full_area = Rectangle::new(Point::new(0, 0), Size::new(VIEW_WIDTH as u32, VIEW_HEIGHT as u32));
-        let _ = display.fill_contiguous(&full_area, framebuf.iter().copied());
+        // Always update 3D Viewport (y = 0..256)
+        let view3d_area = Rectangle::new(Point::new(0, 0), Size::new(VIEW_WIDTH as u32, VIEW3D_HEIGHT as u32));
+        let _ = display.fill_contiguous(&view3d_area, framebuf[..VIEW_WIDTH * VIEW3D_HEIGHT].iter().copied());
+
+        // Update HUD (y = 256..320) on frame 0, when HUD status changes, or every 3 frames
+        let hud_needs_update = frame_count == 0
+            || (frame_count % 3 == 0)
+            || pickup_flash_counter > 0
+            || damage_flash_counter > 0
+            || muzzle_flash_counter > 0
+            || is_dead;
+
+        if hud_needs_update {
+            let hud_area = Rectangle::new(
+                Point::new(0, VIEW3D_HEIGHT as i32),
+                Size::new(VIEW_WIDTH as u32, (VIEW_HEIGHT - VIEW3D_HEIGHT) as u32),
+            );
+            let _ = display.fill_contiguous(&hud_area, framebuf[VIEW_WIDTH * VIEW3D_HEIGHT..].iter().copied());
+        }
 
         last_blit_us = blit_start.elapsed().as_micros();
 
