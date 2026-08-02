@@ -34,6 +34,9 @@ use mipidsi::Builder;
 
 use libm::{cosf, sinf, sqrtf};
 
+use embedded_3dgfx::raycast::{Mode7Renderer, RaycastSprite, Raycaster2D, apply_shade, pack_rgb565_u32};
+use embedded_3dgfx::hud::{FramebufDrawTarget, format_u16_dec};
+
 bind_interrupts!(struct Irqs {
     GPDMA1_CHANNEL0 => InterruptHandler<peripherals::GPDMA1_CH0>;
     GPDMA1_CHANNEL1 => InterruptHandler<peripherals::GPDMA1_CH1>;
@@ -142,114 +145,15 @@ struct Fireball {
 
 
 
-// ----------------------------------------------------------------------------
-// Color Utilities & Shading
-// ----------------------------------------------------------------------------
+
+
+/// Attempt to move the camera by `(dx, dy)` with per-axis map collision.
 #[inline(always)]
-fn apply_shade_fast(color: Rgb565, shade_q8: u32) -> Rgb565 {
-    let raw = color.into_storage() as u32;
-    let r = ((((raw >> 11) & 0x1F) * shade_q8) >> 8).min(31);
-    let g = ((((raw >> 5) & 0x3F) * shade_q8) >> 8).min(63);
-    let b = (((raw & 0x1F) * shade_q8) >> 8).min(31);
-    Rgb565::new(r as u8, g as u8, b as u8)
-}
-
-#[inline(always)]
-fn pack_rgb565_u32(color: Rgb565) -> u32 {
-    let raw = color.into_storage() as u32;
-    (raw << 16) | raw
-}
-
-#[inline(always)]
-fn render_floor_and_ceiling_fast(
-    pos_x: f32,
-    pos_y: f32,
-    dir_x: f32,
-    dir_y: f32,
-    plane_x: f32,
-    plane_y: f32,
-    head_bob: i32,
-    framebuf_u32: &mut [u32],
-) {
-    let horizon = (VIEW3D_HEIGHT / 2) as i32 + head_bob;
-
-    let floor_a_u32   = pack_rgb565_u32(Rgb565::new(16, 12, 4));
-    let floor_b_u32   = pack_rgb565_u32(Rgb565::new(11, 8, 3));
-    let ceiling_a_u32 = pack_rgb565_u32(Rgb565::new(6, 12, 18));
-    let ceiling_b_u32 = pack_rgb565_u32(Rgb565::new(4, 8, 14));
-
-    let fov_inv = 2.0 / (VIEW_WIDTH as f32);
-
-    for y in 0..VIEW3D_HEIGHT {
-        let p = (y as i32 - horizon) as f32;
-        if p == 0.0 { continue; }
-
-        let is_floor = p > 0.0;
-        let row_distance = if is_floor { 160.0 / p } else { 160.0 / -p };
-
-        let step_x = -row_distance * (plane_x * fov_inv) * 2.0;
-        let step_y = -row_distance * (plane_y * fov_inv) * 2.0;
-
-        let mut curr_x = pos_x + row_distance * (dir_x + plane_x);
-        let mut curr_y = pos_y + row_distance * (dir_y + plane_y);
-
-        let row_u32 = y * 120;
-        let (col_a, col_b) = if is_floor {
-            (floor_a_u32, floor_b_u32)
-        } else {
-            (ceiling_a_u32, ceiling_b_u32)
-        };
-
-        for x2 in 0..120 {
-            let tx = (curr_x as usize) & 1;
-            let ty = (curr_y as usize) & 1;
-            let pixel_u32 = if (tx ^ ty) == 0 { col_a } else { col_b };
-
-            framebuf_u32[row_u32 + x2] = pixel_u32;
-            curr_x += step_x;
-            curr_y += step_y;
-        }
-    }
-}
-
-// ----------------------------------------------------------------------------
-// Authentic 1993 DOOM Wall Texture Generator (16x16 Bitmapped Patterns)
-// ----------------------------------------------------------------------------
-#[inline(always)]
-fn get_wall_texture_pixel_raw(tile: u8, tex_x: usize, tex_y: usize) -> Rgb565 {
-    match tile {
-        1 => { // Earthy Tan/Brown Brick Wall (Zero Purple Tint)
-            let is_mortar = (tex_y % 4 == 0)
-                || ((tex_y / 4) % 2 == 0 && tex_x % 8 == 0)
-                || ((tex_y / 4) % 2 == 1 && (tex_x + 4) % 8 == 0);
-            if is_mortar { Rgb565::new(6, 12, 6) } else { Rgb565::new(18, 14, 2) }
-        }
-        2 => { // Tech Blue Panel
-            if tex_y == 2 || tex_y == 14 || (tex_x == 8 && tex_y > 4 && tex_y < 12) {
-                Rgb565::new(0, 50, 25) // Glowing Cyan/Blue LED
-            } else if tex_x == 0 || tex_x == 15 || tex_y == 0 || tex_y == 15 {
-                Rgb565::new(2, 8, 12) // Dark Navy Frame
-            } else {
-                Rgb565::new(4, 16, 22) // Cool Tech Blue Plate
-            }
-        }
-        3 => { // Hazard Warning Stripe
-            if (tex_x + tex_y) % 6 < 3 {
-                Rgb565::YELLOW
-            } else {
-                Rgb565::new(2, 4, 2) // Deep Black
-            }
-        }
-        _ => { // Reinforced Slate Steel Blast Door
-            if tex_x == 0 || tex_x == 15 || tex_y == 0 || tex_y == 15 {
-                Rgb565::new(16, 32, 16) // Outer Steel Frame
-            } else if tex_x >= 12 && tex_x <= 13 && tex_y >= 7 && tex_y <= 9 {
-                Rgb565::YELLOW // Door Handle
-            } else {
-                Rgb565::new(10, 20, 10) // Dark Slate Grey Panel
-            }
-        }
-    }
+fn try_move(pos_x: &mut f32, pos_y: &mut f32, dx: f32, dy: f32, map: &[u8], map_size: usize) {
+    let next_x = *pos_x + dx;
+    let next_y = *pos_y + dy;
+    if map[(next_y as usize) * map_size + (*pos_x as usize)] == 0 { *pos_y = next_y; }
+    if map[(*pos_y as usize) * map_size + (next_x as usize)] == 0 { *pos_x = next_x; }
 }
 
 #[embassy_executor::main]
@@ -338,6 +242,9 @@ async fn main(_spawner: Spawner) {
     let mut manual_mode_timer: u32 = 0;
 
     let mut z_buffer = [0.0f32; VIEW_WIDTH];
+
+    let mode7 = Mode7Renderer::new(VIEW_WIDTH, VIEW3D_HEIGHT);
+    let raycaster = Raycaster2D::new(VIEW_WIDTH, VIEW3D_HEIGHT);
 
     let mut frame_count: u32 = 0;
     let mut head_bob_time: f32 = 0.0;
@@ -470,20 +377,12 @@ async fn main(_spawner: Spawner) {
             }
             if b2_pressed {
                 // B2: Move Forward in Camera Direction
-                let move_speed = 0.06f32;
-                let next_x = pos_x + dir_x * move_speed;
-                let next_y = pos_y + dir_y * move_speed;
-                if MAP[(next_y as usize) * MAP_SIZE + (pos_x as usize)] == 0 { pos_y = next_y; }
-                if MAP[(pos_y as usize) * MAP_SIZE + (next_x as usize)] == 0 { pos_x = next_x; }
+                try_move(&mut pos_x, &mut pos_y, dir_x * 0.06, dir_y * 0.06, &MAP, MAP_SIZE);
                 head_bob_time += 0.25;
             }
             if move_backward {
-                // Move Backward (Reverse direction)
-                let move_speed = 0.06f32;
-                let next_x = pos_x - dir_x * move_speed;
-                let next_y = pos_y - dir_y * move_speed;
-                if MAP[(next_y as usize) * MAP_SIZE + (pos_x as usize)] == 0 { pos_y = next_y; }
-                if MAP[(pos_y as usize) * MAP_SIZE + (next_x as usize)] == 0 { pos_x = next_x; }
+                // Move Backward
+                try_move(&mut pos_x, &mut pos_y, -dir_x * 0.06, -dir_y * 0.06, &MAP, MAP_SIZE);
                 head_bob_time -= 0.25;
             }
         } else if manual_mode_timer > 0 {
@@ -613,15 +512,10 @@ async fn main(_spawner: Spawner) {
             while angle_diff < -core::f32::consts::PI { angle_diff += core::f32::consts::TAU; }
             angle += angle_diff * 0.08;
 
-            let move_speed = 0.045f32;
-
             if dist_to_target < 0.8 {
                 target_wpt_idx = (target_wpt_idx + 1) % PATROL_PATH.len();
             } else {
-                let next_x = pos_x + dir_x * move_speed;
-                let next_y = pos_y + dir_y * move_speed;
-                if MAP[(next_y as usize) * MAP_SIZE + (pos_x as usize)] == 0 { pos_y = next_y; }
-                if MAP[(pos_y as usize) * MAP_SIZE + (next_x as usize)] == 0 { pos_x = next_x; }
+                try_move(&mut pos_x, &mut pos_y, dir_x * 0.045, dir_y * 0.045, &MAP, MAP_SIZE);
             }
             head_bob_time += 0.15;
         }
@@ -629,220 +523,135 @@ async fn main(_spawner: Spawner) {
 
         let raycast_start = Instant::now();
 
-        // Camera plane for 66-degree FOV
-        let fov_scale = 0.66f32;
-        let plane_x = -dir_y * fov_scale;
-        let plane_y = dir_x * fov_scale;
-
         // --------------------------------------------------------------------
-        // --------------------------------------------------------------------
-        // 2. Mode 7 True 3D Perspective Floor & Ceiling Engine (via embedded-3dgfx crate)
+        // 2. Mode 7 True 3D Perspective Floor & Ceiling Engine (embedded-3dgfx)
         // --------------------------------------------------------------------
         let framebuf_u32 = unsafe {
             core::slice::from_raw_parts_mut(framebuf.as_mut_ptr() as *mut u32, VIEW_PIXELS / 2)
         };
 
-        render_floor_and_ceiling_fast(
+        mode7.render_floor_and_ceiling(
             pos_x,
             pos_y,
-            dir_x,
-            dir_y,
-            plane_x,
-            plane_y,
+            angle,
             head_bob,
+            Rgb565::new(16, 12, 4), // floor_a
+            Rgb565::new(11, 8, 3),  // floor_b
+            Rgb565::new(6, 12, 18), // ceil_a
+            Rgb565::new(4, 8, 14),  // ceil_b
             framebuf_u32,
         );
 
         // --------------------------------------------------------------------
-        // 2.5 DDA 3D Wall Column Rendering
+        // 2.5 DDA 3D Wall Column Rendering (embedded-3dgfx textured variant)
         // --------------------------------------------------------------------
-        for x in (0..VIEW_WIDTH).step_by(4) {
-            // Negate camera_x to compensate for display flip_horizontal() orientation
-            let camera_x = -(2.0 * (x as f32) / (VIEW_WIDTH as f32) - 1.0);
-            let ray_dir_x = dir_x + plane_x * camera_x;
-            let ray_dir_y = dir_y + plane_y * camera_x;
-
-            let mut map_x = pos_x as i32;
-            let mut map_y = pos_y as i32;
-
-            let delta_dist_x = if ray_dir_x == 0.0 { 1e30 } else { (1.0 / ray_dir_x).abs() };
-            let delta_dist_y = if ray_dir_y == 0.0 { 1e30 } else { (1.0 / ray_dir_y).abs() };
-
-            let (step_x, mut side_dist_x) = if ray_dir_x < 0.0 {
-                (-1, (pos_x - map_x as f32) * delta_dist_x)
-            } else {
-                (1, (map_x as f32 + 1.0 - pos_x) * delta_dist_x)
-            };
-
-            let (step_y, mut side_dist_y) = if ray_dir_y < 0.0 {
-                (-1, (pos_y - map_y as f32) * delta_dist_y)
-            } else {
-                (1, (map_y as f32 + 1.0 - pos_y) * delta_dist_y)
-            };
-
-            let mut hit_wall = 0u8;
-            let mut side = 0u8;
-            let mut steps = 0;
-
-            while hit_wall == 0 && steps < 24 {
-                if side_dist_x < side_dist_y {
-                    side_dist_x += delta_dist_x;
-                    map_x += step_x;
-                    side = 0;
-                } else {
-                    side_dist_y += delta_dist_y;
-                    map_y += step_y;
-                    side = 1;
+        raycaster.render_walls_textured(
+            pos_x,
+            pos_y,
+            angle,
+            head_bob,
+            &MAP,
+            MAP_SIZE,
+            &mut z_buffer,
+            framebuf_u32,
+            |tile, tex_x, tex_y| {
+                // Authentic 1993 DOOM Wall Texture Generator (16×16 Bitmapped Patterns)
+                match tile {
+                    1 => { // Earthy Tan/Brown Brick Wall
+                        let is_mortar = (tex_y % 4 == 0)
+                            || ((tex_y / 4) % 2 == 0 && tex_x % 8 == 0)
+                            || ((tex_y / 4) % 2 == 1 && (tex_x + 4) % 8 == 0);
+                        if is_mortar { Rgb565::new(6, 12, 6) } else { Rgb565::new(18, 14, 2) }
+                    }
+                    2 => { // Tech Blue Panel
+                        if tex_y == 2 || tex_y == 14 || (tex_x == 8 && tex_y > 4 && tex_y < 12) {
+                            Rgb565::new(0, 50, 25)
+                        } else if tex_x == 0 || tex_x == 15 || tex_y == 0 || tex_y == 15 {
+                            Rgb565::new(2, 8, 12)
+                        } else {
+                            Rgb565::new(4, 16, 22)
+                        }
+                    }
+                    3 => { // Hazard Warning Stripe
+                        if (tex_x + tex_y) % 6 < 3 { Rgb565::YELLOW } else { Rgb565::new(2, 4, 2) }
+                    }
+                    _ => { // Steel Blast Door
+                        if tex_x == 0 || tex_x == 15 || tex_y == 0 || tex_y == 15 {
+                            Rgb565::new(16, 32, 16)
+                        } else if tex_x >= 12 && tex_x <= 13 && tex_y >= 7 && tex_y <= 9 {
+                            Rgb565::YELLOW
+                        } else {
+                            Rgb565::new(10, 20, 10)
+                        }
+                    }
                 }
+            },
+        );
 
-                if map_x >= 0 && map_x < MAP_SIZE as i32 && map_y >= 0 && map_y < MAP_SIZE as i32 {
-                    let tile = MAP[(map_y as usize) * MAP_SIZE + (map_x as usize)];
-                    if tile > 0 { hit_wall = tile; }
-                } else {
-                    hit_wall = 1;
-                }
-                steps += 1;
-            }
+        // --------------------------------------------------------------------
+        // 3. Render Billboarded 3D Sprites & Flying Fireballs (embedded-3dgfx)
+        // --------------------------------------------------------------------
 
-            let perp_wall_dist = if side == 0 {
-                side_dist_x - delta_dist_x
-            } else {
-                side_dist_y - delta_dist_y
-            }.max(0.1);
-
-            // Fill all 4 z-buffer slots for sprite occlusion
-            z_buffer[x]     = perp_wall_dist;
-            z_buffer[x + 1] = perp_wall_dist;
-            z_buffer[x + 2] = perp_wall_dist;
-            z_buffer[x + 3] = perp_wall_dist;
-
-            let line_height = (VIEW3D_HEIGHT as f32 / perp_wall_dist) as i32;
-            let center_y = (VIEW3D_HEIGHT / 2) as i32 + head_bob;
-
-            let draw_start = (center_y - line_height / 2).clamp(0, VIEW3D_HEIGHT as i32 - 1) as usize;
-            let draw_end   = (center_y + line_height / 2).clamp(0, VIEW3D_HEIGHT as i32 - 1) as usize;
-
-            // Calculate exact fractional wall hit position for texture mapping
-            let mut wall_x = if side == 0 {
-                pos_y + perp_wall_dist * ray_dir_y
-            } else {
-                pos_x + perp_wall_dist * ray_dir_x
-            };
-            wall_x -= (wall_x as i32) as f32;
-            let tex_x = ((wall_x * 16.0) as usize).clamp(0, 15);
-
-            let base_shade = 1.0 / (1.0 + perp_wall_dist * 0.18);
-            let effective_shade = if side == 1 { base_shade * 0.7 } else { base_shade };
-            let shade_q8 = (effective_shade.clamp(0.05, 1.0) * 256.0) as u32;
-            let x_u32 = x / 2;
-
-            // Textured 3D Wall Column
-            let tex_step = 16.0 / (line_height as f32).max(1.0);
-            let mut tex_pos = ((draw_start as i32 - center_y + line_height / 2) as f32) * tex_step;
-
-            for y in draw_start..=draw_end {
-                let tex_y = (tex_pos as usize) & 15;
-                tex_pos += tex_step;
-
-                let tex_color = get_wall_texture_pixel_raw(hit_wall, tex_x, tex_y);
-                let shaded_pixel = apply_shade_fast(tex_color, shade_q8);
-                let pixel_u32 = pack_rgb565_u32(shaded_pixel);
-
-                let idx = y * 120 + x_u32;
-                framebuf_u32[idx]     = pixel_u32;
-                framebuf_u32[idx + 1] = pixel_u32;
-            }
+        // Build a unified RaycastSprite slice that covers world sprites + active fireballs.
+        // Fireballs are encoded with texture_id = 255 to distinguish them from game sprites.
+        let mut rc_sprites = [RaycastSprite { x: 0.0, y: 0.0, texture_id: 0, active: false }; 13];
+        for (i, s) in sprites.iter().enumerate() {
+            rc_sprites[i] = RaycastSprite { x: s.x, y: s.y, texture_id: s.kind, active: s.active };
+        }
+        for (i, fb) in fireballs.iter().enumerate() {
+            rc_sprites[9 + i] = RaycastSprite { x: fb.x, y: fb.y, texture_id: 255, active: fb.active };
         }
 
-        // --------------------------------------------------------------------
-        // 3. Render Billboarded 3D Sprites & Flying Fireballs
-        // --------------------------------------------------------------------
-        for sprite in sprites.iter() {
-            if !sprite.active { continue; }
-
-            let sprite_x = sprite.x - pos_x;
-            let sprite_y = sprite.y - pos_y;
-
-            let inv_det = 1.0 / (plane_x * dir_y - dir_x * plane_y);
-            let transform_x = inv_det * (dir_y * sprite_x - dir_x * sprite_y);
-            let transform_y = inv_det * (-plane_y * sprite_x + plane_x * sprite_y);
-
-            if transform_y > 0.3 {
-                let sprite_screen_x = ((VIEW_WIDTH as f32 / 2.0) * (1.0 - transform_x / transform_y)) as i32;
-                let sprite_height = ((VIEW3D_HEIGHT as f32 / transform_y).abs()) as i32;
-                let sprite_width = sprite_height;
-
-                let center_y = (VIEW3D_HEIGHT / 2) as i32 + head_bob;
-                let draw_start_y = (center_y - sprite_height / 2).clamp(0, VIEW3D_HEIGHT as i32 - 1) as usize;
-                let draw_end_y = (center_y + sprite_height / 2).clamp(0, VIEW3D_HEIGHT as i32 - 1) as usize;
-
-                let draw_start_x = (sprite_screen_x - sprite_width / 2).clamp(0, VIEW_WIDTH as i32 - 1) as usize;
-                let draw_end_x = (sprite_screen_x + sprite_width / 2).clamp(0, VIEW_WIDTH as i32 - 1) as usize;
-
-                let base_color = if sprite.hit_flash > 0 {
-                    Rgb565::WHITE // White impact flash when shot!
+        raycaster.render_sprites(
+            pos_x,
+            pos_y,
+            angle,
+            head_bob,
+            &rc_sprites,
+            &z_buffer,
+            framebuf,
+            |rc_s, norm_y| {
+                // Look up the original game sprite to get hit_flash state
+                let game_sprite = if rc_s.texture_id == 255 {
+                    // Fireball
+                    return Some(Rgb565::new(31, 32, 0));
                 } else {
-                    match sprite.kind {
-                        1 => Rgb565::new(16, 40, 8),           // Toxic Green Barrel
-                        2 => Rgb565::GREEN,                    // Health Pack (+25 HP)
-                        3 => Rgb565::new(18, 10, 4),           // Classic DOOM Ochre-Brown Imp
-                        _ => Rgb565::new(0, 36, 31),           // Steel Blue Ammo Crate
-                    }
+                    sprites.iter().find(|s| s.active && s.kind == rc_s.texture_id
+                        && (s.x - rc_s.x).abs() < 0.01 && (s.y - rc_s.y).abs() < 0.01)
                 };
-                let shade_q8 = ((1.0 / (1.0 + transform_y * 0.2)).clamp(0.05, 1.0) * 256.0) as u32;
-                let shaded_sprite = apply_shade_fast(base_color, shade_q8);
 
-                for stripe_x in draw_start_x..draw_end_x {
-                    if transform_y < z_buffer[stripe_x] {
-                        for y in draw_start_y..draw_end_y {
-                            let row = y * VIEW_WIDTH;
-                            // Imp red eye detail near the top of the sprite head
-                            let pixel_color = if sprite.kind == 3 && sprite.hit_flash == 0 && y >= draw_start_y + (draw_end_y - draw_start_y) / 6 && y <= draw_start_y + (draw_end_y - draw_start_y) / 4 {
-                                Rgb565::RED
-                            } else {
-                                shaded_sprite
-                            };
-                            if (stripe_x + y) % 2 == 0 {
-                                framebuf[row + stripe_x] = pixel_color;
-                            }
+                let dist = libm::sqrtf(
+                    (rc_s.x - pos_x) * (rc_s.x - pos_x) + (rc_s.y - pos_y) * (rc_s.y - pos_y)
+                );
+                let shade = (1.0 / (1.0 + dist * 0.2)).clamp(0.05, 1.0);
+
+                if let Some(sp) = game_sprite {
+                    let base_color = if sp.hit_flash > 0 {
+                        Rgb565::WHITE
+                    } else {
+                        match sp.kind {
+                            1 => Rgb565::new(16, 40, 8),  // Toxic Green Barrel
+                            2 => Rgb565::GREEN,            // Health Pack
+                            3 => Rgb565::new(18, 10, 4),  // Ochre-Brown Imp
+                            _ => Rgb565::new(0, 36, 31),  // Steel Blue Ammo Crate
                         }
-                    }
+                    };
+                    let shaded = apply_shade(base_color, shade);
+                    // Imp red eye detail in the upper quarter
+                    let pixel = if sp.kind == 3 && sp.hit_flash == 0 && norm_y >= 1.0/6.0 && norm_y <= 1.0/4.0 {
+                        Rgb565::RED
+                    } else {
+                        shaded
+                    };
+                    // Checkerboard dither for transparency effect
+                    let sx = (rc_s.x * 100.0) as usize;
+                    let sy = (norm_y * 100.0) as usize;
+                    if (sx + sy) % 2 == 0 { Some(pixel) } else { None }
+                } else {
+                    None
                 }
-            }
-        }
-
-        // Render Flying 3D Fireballs (Glowing Orange/Yellow Orbs)
-        for fb in fireballs.iter() {
-            if !fb.active { continue; }
-            let fb_x = fb.x - pos_x;
-            let fb_y = fb.y - pos_y;
-
-            let inv_det = 1.0 / (plane_x * dir_y - dir_x * plane_y);
-            let transform_x = inv_det * (dir_y * fb_x - dir_x * fb_y);
-            let transform_y = inv_det * (-plane_y * fb_x + plane_x * fb_y);
-
-            if transform_y > 0.3 {
-                let fb_screen_x = ((VIEW_WIDTH as f32 / 2.0) * (1.0 - transform_x / transform_y)) as i32;
-                let fb_size = (((VIEW3D_HEIGHT as f32 / transform_y).abs()) * 0.4) as i32;
-
-                let center_y = (VIEW3D_HEIGHT / 2) as i32 + head_bob;
-                let draw_start_y = (center_y - fb_size / 2).clamp(0, VIEW3D_HEIGHT as i32 - 1) as usize;
-                let draw_end_y = (center_y + fb_size / 2).clamp(0, VIEW3D_HEIGHT as i32 - 1) as usize;
-
-                let draw_start_x = (fb_screen_x - fb_size / 2).clamp(0, VIEW_WIDTH as i32 - 1) as usize;
-                let draw_end_x = (fb_screen_x + fb_size / 2).clamp(0, VIEW_WIDTH as i32 - 1) as usize;
-
-                let fb_color = Rgb565::new(31, 32, 0); // Fiery Glowing Orange
-
-                for stripe_x in draw_start_x..draw_end_x {
-                    if transform_y < z_buffer[stripe_x] {
-                        for y in draw_start_y..draw_end_y {
-                            framebuf[y * VIEW_WIDTH + stripe_x] = fb_color;
-                        }
-                    }
-                }
-            }
-        }
+            },
+        );
 
         // --------------------------------------------------------------------
         // 4. Render Crosshair & First-Person Weapon at Bottom Center
@@ -941,27 +750,16 @@ async fn main(_spawner: Spawner) {
 
         // A. AMMO (x=3) & HEALTH (x=52) — left side
         {
-            let mut hud_offscreen = OffscreenBuffer {
-                pixels: framebuf,
-                dirty: DirtyRect::empty(),
-            };
+            let mut fb = FramebufDrawTarget::new(framebuf, VIEW_WIDTH, VIEW_HEIGHT);
             let ty = (HUD_Y + 6) as i32;
             let vy = (HUD_Y + 20) as i32;
 
-            let mut ammo_buf = [b' '; 4];
-            let mut num = ammo_count;
-            ammo_buf[3] = b'0' + (num % 10) as u8; num /= 10;
-            ammo_buf[2] = b'0' + (num % 10) as u8; num /= 10;
-            ammo_buf[1] = b'0' + (num % 10) as u8;
-            let ammo_str = core::str::from_utf8(&ammo_buf).unwrap_or(" 050");
+            let mut buf = [b' '; 4];
+            let ammo_str = format_u16_dec(ammo_count, &mut buf, 3);
 
-            let mut health_buf = [b' '; 5];
-            let mut h_num = health_count;
-            health_buf[4] = b'%';
-            health_buf[3] = b'0' + (h_num % 10) as u8; h_num /= 10;
-            health_buf[2] = b'0' + (h_num % 10) as u8; h_num /= 10;
-            health_buf[1] = b'0' + (h_num % 10) as u8;
-            let health_str = core::str::from_utf8(&health_buf).unwrap_or(" 100%");
+            let mut hbuf = [b' '; 5];
+            hbuf[4] = b'%';
+            let health_str = format_u16_dec(health_count, &mut hbuf, 3);
 
             let val_style = if pickup_flash_counter > 0 {
                 MonoTextStyle::new(&FONT_6X10, Rgb565::WHITE)
@@ -969,10 +767,10 @@ async fn main(_spawner: Spawner) {
                 hud_val_style
             };
 
-            let _ = Text::with_baseline("AMMO",     Point::new(3,  ty), hud_text_style, Baseline::Top).draw(&mut hud_offscreen);
-            let _ = Text::with_baseline(ammo_str,   Point::new(3,  vy), val_style,      Baseline::Top).draw(&mut hud_offscreen);
-            let _ = Text::with_baseline("HEALTH",   Point::new(52, ty), hud_text_style, Baseline::Top).draw(&mut hud_offscreen);
-            let _ = Text::with_baseline(health_str, Point::new(52, vy), val_style,      Baseline::Top).draw(&mut hud_offscreen);
+            let _ = Text::with_baseline("AMMO",     Point::new(3,  ty), hud_text_style, Baseline::Top).draw(&mut fb);
+            let _ = Text::with_baseline(ammo_str,   Point::new(3,  vy), val_style,      Baseline::Top).draw(&mut fb);
+            let _ = Text::with_baseline("HEALTH",   Point::new(52, ty), hud_text_style, Baseline::Top).draw(&mut fb);
+            let _ = Text::with_baseline(health_str, Point::new(52, vy), val_style,      Baseline::Top).draw(&mut fb);
         }
 
         // B. DOOM Guy Face — centered at x=106 (face 28px wide)
@@ -1024,30 +822,24 @@ async fn main(_spawner: Spawner) {
                 }
             }
 
-            let mut hud_offscreen = OffscreenBuffer {
-                pixels: framebuf,
-                dirty: DirtyRect::empty(),
-            };
+            let mut fb = FramebufDrawTarget::new(framebuf, VIEW_WIDTH, VIEW_HEIGHT);
             let death_title_style = MonoTextStyle::new(&FONT_6X10, Rgb565::WHITE);
             let death_sub_style   = MonoTextStyle::new(&FONT_6X10, Rgb565::YELLOW);
 
-            let _ = Text::with_baseline("================================", Point::new(24,  90), death_title_style, Baseline::Top).draw(&mut hud_offscreen);
-            let _ = Text::with_baseline("YOU DIED!",                    Point::new(93, 105), death_title_style, Baseline::Top).draw(&mut hud_offscreen);
-            let _ = Text::with_baseline("TAP TO RESPAWN",                Point::new(78, 122), death_sub_style,   Baseline::Top).draw(&mut hud_offscreen);
-            let _ = Text::with_baseline("================================", Point::new(24, 137), death_title_style, Baseline::Top).draw(&mut hud_offscreen);
+            let _ = Text::with_baseline("================================", Point::new(24,  90), death_title_style, Baseline::Top).draw(&mut fb);
+            let _ = Text::with_baseline("YOU DIED!",                    Point::new(93, 105), death_title_style, Baseline::Top).draw(&mut fb);
+            let _ = Text::with_baseline("TAP TO RESPAWN",                Point::new(78, 122), death_sub_style,   Baseline::Top).draw(&mut fb);
+            let _ = Text::with_baseline("================================", Point::new(24, 137), death_title_style, Baseline::Top).draw(&mut fb);
         }
 
         // C. MODE label — right of face (x=140)
         {
-            let mut hud_offscreen = OffscreenBuffer {
-                pixels: framebuf,
-                dirty: DirtyRect::empty(),
-            };
+            let mut fb = FramebufDrawTarget::new(framebuf, VIEW_WIDTH, VIEW_HEIGHT);
             let mode_str = if is_manual { "MANUAL" } else { " AUTO " };
             let ty = (HUD_Y + 6) as i32;
             let vy = (HUD_Y + 20) as i32;
-            let _ = Text::with_baseline("MODE",   Point::new(140, ty), hud_text_style, Baseline::Top).draw(&mut hud_offscreen);
-            let _ = Text::with_baseline(mode_str, Point::new(140, vy), hud_val_style,  Baseline::Top).draw(&mut hud_offscreen);
+            let _ = Text::with_baseline("MODE",   Point::new(140, ty), hud_text_style, Baseline::Top).draw(&mut fb);
+            let _ = Text::with_baseline(mode_str, Point::new(140, vy), hud_val_style,  Baseline::Top).draw(&mut fb);
         }
 
         // D. Minimap — right side of HUD (x=186..234, y=HUD_Y+4..HUD_Y+52)
@@ -1137,61 +929,5 @@ async fn main(_spawner: Spawner) {
         }
 
         ticker.next().await;
-    }
-}
-
-// ----------------------------------------------------------------------------
-// Offscreen Buffer Helper for embedded-graphics Text Rendering into SRAM
-// ----------------------------------------------------------------------------
-struct OffscreenBuffer<'a> {
-    pixels: &'a mut [Rgb565; VIEW_PIXELS],
-    dirty: DirtyRect,
-}
-
-#[derive(Clone, Copy)]
-struct DirtyRect {
-    min_x: usize,
-    min_y: usize,
-    max_x: usize,
-    max_y: usize,
-}
-
-impl DirtyRect {
-    fn empty() -> Self {
-        Self { min_x: VIEW_WIDTH, min_y: VIEW_HEIGHT, max_x: 0, max_y: 0 }
-    }
-    fn add_point(&mut self, x: usize, y: usize) {
-        if x < self.min_x { self.min_x = x; }
-        if y < self.min_y { self.min_y = y; }
-        if x > self.max_x { self.max_x = x; }
-        if y > self.max_y { self.max_y = y; }
-    }
-}
-
-impl<'a> OriginDimensions for OffscreenBuffer<'a> {
-    fn size(&self) -> Size {
-        Size::new(VIEW_WIDTH as u32, VIEW_HEIGHT as u32)
-    }
-}
-
-impl<'a> DrawTarget for OffscreenBuffer<'a> {
-    type Color = Rgb565;
-    type Error = core::convert::Infallible;
-
-    #[inline]
-    fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
-    where
-        I: IntoIterator<Item = Pixel<Self::Color>>,
-    {
-        for Pixel(coord, color) in pixels.into_iter() {
-            if coord.x >= 0 && coord.x < VIEW_WIDTH as i32 && coord.y >= 0 && coord.y < VIEW_HEIGHT as i32 {
-                let x = coord.x as usize;
-                let y = coord.y as usize;
-                let idx = y * VIEW_WIDTH + x;
-                self.pixels[idx] = color;
-                self.dirty.add_point(x, y);
-            }
-        }
-        Ok(())
     }
 }
