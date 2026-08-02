@@ -10,25 +10,25 @@ use embassy_executor::Spawner;
 use embassy_stm32::bind_interrupts;
 use embassy_stm32::dma::InterruptHandler;
 use embassy_stm32::gpio::{Input, Level, Output, Pull, Speed};
+use embassy_stm32::i2c::{Config as I2cConfig, I2c};
 use embassy_stm32::peripherals;
 use embassy_stm32::rcc::*;
-use embassy_stm32::i2c::{Config as I2cConfig, I2c};
 use embassy_stm32::usb::{self, HostDriver};
 use embassy_usb_host::class::hid::HidHost;
 use embassy_usb_host::{BusRoute, BusState};
 #[path = "../ft6236.rs"]
 mod ft6236;
-use ft6236::FT6236;
 use embassy_stm32::spi::{Config as SpiConfig, Spi};
 use embassy_stm32::time::Hertz;
 use embassy_stm32::Config;
 use embassy_time::{Duration, Instant, Ticker};
 use embedded_hal_bus::spi::ExclusiveDevice;
+use ft6236::FT6236;
 
 use embedded_graphics::mono_font::{ascii::FONT_6X10, MonoTextStyle};
 use embedded_graphics::pixelcolor::Rgb565;
-use embedded_graphics::primitives::Rectangle;
 use embedded_graphics::prelude::*;
+use embedded_graphics::primitives::Rectangle;
 use embedded_graphics::text::{Baseline, Text};
 
 use mipidsi::interface::SpiInterface;
@@ -38,8 +38,10 @@ use mipidsi::Builder;
 
 use libm::{cosf, sinf, sqrtf};
 
-use embedded_3dgfx::raycast::{Mode7Renderer, RaycastSprite, Raycaster2D, apply_shade, pack_rgb565_u32};
-use embedded_3dgfx::hud::{FramebufDrawTarget, format_u16_dec};
+use embedded_3dgfx::hud::{format_u16_dec, FramebufDrawTarget};
+use embedded_3dgfx::raycast::{
+    apply_shade, pack_rgb565_u32, Mode7Renderer, RaycastSprite, Raycaster2D,
+};
 
 bind_interrupts!(struct Irqs {
     GPDMA1_CHANNEL0 => InterruptHandler<peripherals::GPDMA1_CH0>;
@@ -70,7 +72,9 @@ async fn usb_host_task(
         defmt::info!("USB Device connected at speed {:?}", speed);
 
         let mut config_buf = [0u8; 256];
-        let result = bus.enumerate(BusRoute::Direct(speed), &mut config_buf).await;
+        let result = bus
+            .enumerate(BusRoute::Direct(speed), &mut config_buf)
+            .await;
 
         let (enum_info, config_len) = match result {
             Ok(r) => r,
@@ -222,29 +226,23 @@ const VIEW_PIXELS: usize = VIEW_WIDTH * VIEW_HEIGHT;
 struct FrameBuffer([Rgb565; VIEW_PIXELS]);
 struct SafeFrameBuf(UnsafeCell<FrameBuffer>);
 unsafe impl Sync for SafeFrameBuf {}
-static RAW_FRAMEBUF_A: SafeFrameBuf = SafeFrameBuf(UnsafeCell::new(FrameBuffer([Rgb565::BLACK; VIEW_PIXELS])));
-static RAW_FRAMEBUF_B: SafeFrameBuf = SafeFrameBuf(UnsafeCell::new(FrameBuffer([Rgb565::BLACK; VIEW_PIXELS])));
+static RAW_FRAMEBUF_A: SafeFrameBuf =
+    SafeFrameBuf(UnsafeCell::new(FrameBuffer([Rgb565::BLACK; VIEW_PIXELS])));
+static RAW_FRAMEBUF_B: SafeFrameBuf =
+    SafeFrameBuf(UnsafeCell::new(FrameBuffer([Rgb565::BLACK; VIEW_PIXELS])));
 // ----------------------------------------------------------------------------
 // DOOM E1M1-Inspired 16x16 Level Map
 // ----------------------------------------------------------------------------
 const MAP_SIZE: usize = 16;
 static MAP: [u8; MAP_SIZE * MAP_SIZE] = [
-    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-    1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1,
-    1, 0, 0, 0, 0, 0, 6, 0, 6, 0, 3, 0, 2, 2, 0, 1,
-    1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 2, 0, 0, 1,
-    1, 0, 0, 0, 0, 0, 6, 0, 6, 0, 3, 0, 2, 0, 0, 1,
-    1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 0, 1,
-    1, 0, 6, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1,
-    1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 5, 0, 3, 1,
-    1, 0, 6, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 3, 1,
-    1, 0, 0, 0, 0, 0, 6, 0, 0, 0, 3, 0, 6, 0, 3, 1,
-    1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 1,
-    1, 0, 2, 2, 0, 0, 6, 0, 0, 0, 3, 0, 6, 0, 3, 1,
-    1, 0, 2, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 3, 1,
-    1, 0, 2, 0, 0, 0, 0, 0, 0, 0, 3, 0, 5, 0, 3, 1,
-    1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1,
+    1, 0, 0, 0, 0, 0, 6, 0, 6, 0, 3, 0, 2, 2, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 2, 0, 0, 1,
+    1, 0, 0, 0, 0, 0, 6, 0, 6, 0, 3, 0, 2, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 0, 1,
+    1, 0, 6, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 5, 0, 3, 1,
+    1, 0, 6, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 3, 1, 1, 0, 0, 0, 0, 0, 6, 0, 0, 0, 3, 0, 6, 0, 3, 1,
+    1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 1, 1, 0, 2, 2, 0, 0, 6, 0, 0, 0, 3, 0, 6, 0, 3, 1,
+    1, 0, 2, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 3, 1, 1, 0, 2, 0, 0, 0, 0, 0, 0, 0, 3, 0, 5, 0, 3, 1,
+    1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
 ];
 
 // Waypoints for smooth level walkthrough patrol camera
@@ -269,23 +267,95 @@ static PATROL_PATH: [Waypoint; 8] = [
 struct Sprite {
     x: f32,
     y: f32,
-    kind: u8,       // 1 = Barrel, 2 = Health Kit, 3 = Imp Enemy, 4 = Ammo Crate
+    kind: u8, // 1 = Barrel, 2 = Health Kit, 3 = Imp Enemy, 4 = Ammo Crate
     active: bool,
-    hp: i8,          // Enemy HP (Imps start with 2 HP)
-    cooldown: u8,    // Attack cooldown timer
-    hit_flash: u8,   // Flash white on hit
+    hp: i8,        // Enemy HP (Imps start with 2 HP)
+    cooldown: u8,  // Attack cooldown timer
+    hit_flash: u8, // Flash white on hit
 }
 
 static INITIAL_SPRITES: [Sprite; 9] = [
-    Sprite { x: 3.5, y: 3.5, kind: 1, active: true, hp: 1, cooldown: 0, hit_flash: 0 },   // Barrel
-    Sprite { x: 7.5, y: 4.0, kind: 2, active: true, hp: 1, cooldown: 0, hit_flash: 0 },   // Health Pack (+25 HP)
-    Sprite { x: 2.5, y: 13.5, kind: 3, active: true, hp: 2, cooldown: 20, hit_flash: 0 }, // Imp 1 (Far South Corridor)
-    Sprite { x: 13.5, y: 12.5, kind: 3, active: true, hp: 2, cooldown: 30, hit_flash: 0 }, // Imp 2 (Far Southeast Room)
-    Sprite { x: 13.5, y: 3.5, kind: 3, active: true, hp: 2, cooldown: 40, hit_flash: 0 },  // Imp 3 (Far Northeast Room)
-    Sprite { x: 13.5, y: 10.5, kind: 1, active: true, hp: 1, cooldown: 0, hit_flash: 0 }, // Barrel
-    Sprite { x: 8.5, y: 12.5, kind: 2, active: true, hp: 1, cooldown: 0, hit_flash: 0 },  // Health Pack (+25 HP)
-    Sprite { x: 5.5, y: 10.5, kind: 4, active: true, hp: 1, cooldown: 0, hit_flash: 0 },  // Ammo Crate (+20 Ammo)
-    Sprite { x: 10.5, y: 3.5, kind: 4, active: true, hp: 1, cooldown: 0, hit_flash: 0 },  // Ammo Crate (+20 Ammo)
+    Sprite {
+        x: 3.5,
+        y: 3.5,
+        kind: 1,
+        active: true,
+        hp: 1,
+        cooldown: 0,
+        hit_flash: 0,
+    }, // Barrel
+    Sprite {
+        x: 7.5,
+        y: 4.0,
+        kind: 2,
+        active: true,
+        hp: 1,
+        cooldown: 0,
+        hit_flash: 0,
+    }, // Health Pack (+25 HP)
+    Sprite {
+        x: 2.5,
+        y: 13.5,
+        kind: 3,
+        active: true,
+        hp: 2,
+        cooldown: 20,
+        hit_flash: 0,
+    }, // Imp 1 (Far South Corridor)
+    Sprite {
+        x: 13.5,
+        y: 12.5,
+        kind: 3,
+        active: true,
+        hp: 2,
+        cooldown: 30,
+        hit_flash: 0,
+    }, // Imp 2 (Far Southeast Room)
+    Sprite {
+        x: 13.5,
+        y: 3.5,
+        kind: 3,
+        active: true,
+        hp: 2,
+        cooldown: 40,
+        hit_flash: 0,
+    }, // Imp 3 (Far Northeast Room)
+    Sprite {
+        x: 13.5,
+        y: 10.5,
+        kind: 1,
+        active: true,
+        hp: 1,
+        cooldown: 0,
+        hit_flash: 0,
+    }, // Barrel
+    Sprite {
+        x: 8.5,
+        y: 12.5,
+        kind: 2,
+        active: true,
+        hp: 1,
+        cooldown: 0,
+        hit_flash: 0,
+    }, // Health Pack (+25 HP)
+    Sprite {
+        x: 5.5,
+        y: 10.5,
+        kind: 4,
+        active: true,
+        hp: 1,
+        cooldown: 0,
+        hit_flash: 0,
+    }, // Ammo Crate (+20 Ammo)
+    Sprite {
+        x: 10.5,
+        y: 3.5,
+        kind: 4,
+        active: true,
+        hp: 1,
+        cooldown: 0,
+        hit_flash: 0,
+    }, // Ammo Crate (+20 Ammo)
 ];
 
 // 3D World Fireball Projectile
@@ -298,17 +368,17 @@ struct Fireball {
     active: bool,
 }
 
-
-
-
-
 /// Attempt to move the camera by `(dx, dy)` with per-axis map collision.
 #[inline(always)]
 fn try_move(pos_x: &mut f32, pos_y: &mut f32, dx: f32, dy: f32, map: &[u8], map_size: usize) {
     let next_x = *pos_x + dx;
     let next_y = *pos_y + dy;
-    if map[(next_y as usize) * map_size + (*pos_x as usize)] == 0 { *pos_y = next_y; }
-    if map[(*pos_y as usize) * map_size + (next_x as usize)] == 0 { *pos_x = next_x; }
+    if map[(next_y as usize) * map_size + (*pos_x as usize)] == 0 {
+        *pos_y = next_y;
+    }
+    if map[(*pos_y as usize) * map_size + (next_x as usize)] == 0 {
+        *pos_x = next_x;
+    }
 }
 
 #[embassy_executor::main]
@@ -338,11 +408,12 @@ async fn main(spawner: Spawner) {
     defmt::info!("Engine: DDA Fast Raycaster + 25MHz SPI DMA + USB Host HID");
     defmt::info!("============================================");
 
-    // Spawn USB Host background task
-    spawner.spawn(usb_host_task(p.USB_OTG_HS, p.PD6, p.PD7).expect("Failed to spawn USB host task"));
+    // Temporarily disabled USB Host background task to isolate debug probe issue
+    // spawner
+    //     .spawn(usb_host_task(p.USB_OTG_HS, p.PD6, p.PD7).expect("Failed to spawn USB host task"));
 
     let mut spi_config = SpiConfig::default();
-    spi_config.frequency = Hertz(33_333_333); // High-speed 33.3 MHz SPI bus
+    spi_config.frequency = Hertz(25_000_000); // High-speed 33.3 MHz SPI bus
 
     let spi = Spi::new(
         p.SPI2,
@@ -371,15 +442,14 @@ async fn main(spawner: Spawner) {
         .unwrap();
 
     let btn1 = Input::new(p.PC13, Pull::Up); // USER1 Button B1 (Leftmost): Turn Left (PC13)
-    let btn2 = Input::new(p.PC5, Pull::Up);  // USER2 Button B2 (Center): Move Forward (PC5)
-    let btn3 = Input::new(p.PB4, Pull::Up);  // USER3 Button B3 (Rightmost): Turn Right (PB4)
+    let btn2 = Input::new(p.PC5, Pull::Up); // USER2 Button B2 (Center): Move Forward (PC5)
+    let btn3 = Input::new(p.PB4, Pull::Up); // USER3 Button B3 (Rightmost): Turn Right (PB4)
 
     // Touch Controller I2C1 Setup (SDA=PB1, SCL=PB2, INT=PE0) using FT6236 driver (400kHz Fast Mode)
     let mut i2c_config = I2cConfig::default();
     i2c_config.frequency = Hertz(400_000); // 400kHz Fast Mode I2C
     let mut i2c = I2c::new_blocking(
-        p.I2C1,
-        p.PB2, // SCL (Arduino D15)
+        p.I2C1, p.PB2, // SCL (Arduino D15)
         p.PB1, // SDA (Arduino D14)
         i2c_config,
     );
@@ -387,7 +457,6 @@ async fn main(spawner: Spawner) {
     let mut touch_dev = FT6236::new(&mut i2c);
 
     let mut use_buf_a = true;
-
 
     let hud_text_style = MonoTextStyle::new(&FONT_6X10, Rgb565::RED);
     let hud_val_style = MonoTextStyle::new(&FONT_6X10, Rgb565::YELLOW);
@@ -422,7 +491,13 @@ async fn main(spawner: Spawner) {
     let mut damage_flash_counter: u8 = 0;
 
     let mut sprites = INITIAL_SPRITES;
-    let mut fireballs = [Fireball { x: 0.0, y: 0.0, vx: 0.0, vy: 0.0, active: false }; 4];
+    let mut fireballs = [Fireball {
+        x: 0.0,
+        y: 0.0,
+        vx: 0.0,
+        vy: 0.0,
+        active: false,
+    }; 4];
     let mut respawn_timer: u16 = 0;
 
     let mut ticker = Ticker::every(Duration::from_millis(16)); // Target 60 FPS
@@ -458,7 +533,7 @@ async fn main(spawner: Spawner) {
 
         let mut b1_pressed = btn1.is_low() || usb_right; // B1 (Leftmost): Turn Right
         let mut b2_pressed = btn2.is_low() || usb_forward; // B2 (Center): Move Forward
-        let mut b3_pressed = btn3.is_low() || usb_left;  // B3 (Rightmost): Turn Left
+        let mut b3_pressed = btn3.is_low() || usb_left; // B3 (Rightmost): Turn Left
         let mut move_backward = usb_backward;
         let mut shoot_pressed = usb_shoot;
 
@@ -510,7 +585,9 @@ async fn main(spawner: Spawner) {
                         let transform_x = inv_det * (dir_y * sprite_x - dir_x * sprite_y);
                         let transform_y = inv_det * (-plane_y * sprite_x + plane_x * sprite_y);
                         if transform_y > 0.3 {
-                            let sprite_screen_x = ((VIEW_WIDTH as f32 / 2.0) * (1.0 - transform_x / transform_y)) as i32;
+                            let sprite_screen_x = ((VIEW_WIDTH as f32 / 2.0)
+                                * (1.0 - transform_x / transform_y))
+                                as i32;
                             let sprite_width = ((VIEW3D_HEIGHT as f32 / transform_y).abs()) as i32;
                             if (120 - sprite_screen_x).abs() < sprite_width / 2 + 12 {
                                 sprite.hp -= 1;
@@ -533,21 +610,39 @@ async fn main(spawner: Spawner) {
             if b1_pressed {
                 // B1: Rotate Camera Right
                 angle += 0.05f32;
-                if angle > core::f32::consts::TAU { angle -= core::f32::consts::TAU; }
+                if angle > core::f32::consts::TAU {
+                    angle -= core::f32::consts::TAU;
+                }
             }
             if b3_pressed {
                 // B3: Rotate Camera Left
                 angle -= 0.05f32;
-                if angle < 0.0 { angle += core::f32::consts::TAU; }
+                if angle < 0.0 {
+                    angle += core::f32::consts::TAU;
+                }
             }
             if b2_pressed {
                 // B2: Move Forward in Camera Direction
-                try_move(&mut pos_x, &mut pos_y, dir_x * 0.06, dir_y * 0.06, &MAP, MAP_SIZE);
+                try_move(
+                    &mut pos_x,
+                    &mut pos_y,
+                    dir_x * 0.06,
+                    dir_y * 0.06,
+                    &MAP,
+                    MAP_SIZE,
+                );
                 head_bob_time += 0.25;
             }
             if move_backward {
                 // Move Backward
-                try_move(&mut pos_x, &mut pos_y, -dir_x * 0.06, -dir_y * 0.06, &MAP, MAP_SIZE);
+                try_move(
+                    &mut pos_x,
+                    &mut pos_y,
+                    -dir_x * 0.06,
+                    -dir_y * 0.06,
+                    &MAP,
+                    MAP_SIZE,
+                );
                 head_bob_time -= 0.25;
             }
         } else if manual_mode_timer > 0 {
@@ -568,11 +663,17 @@ async fn main(spawner: Spawner) {
                 let dy = pos_y - fb.y;
                 let dist_sq = dx * dx + dy * dy;
 
-                if dist_sq < 0.64 { // Hits player!
+                if dist_sq < 0.64 {
+                    // Hits player!
                     health_count = health_count.saturating_sub(18);
                     damage_flash_counter = 8;
                     fb.active = false;
-                } else if fb.x < 0.5 || fb.x > 15.5 || fb.y < 0.5 || fb.y > 15.5 || MAP[(fb.y as usize) * MAP_SIZE + (fb.x as usize)] > 0 {
+                } else if fb.x < 0.5
+                    || fb.x > 15.5
+                    || fb.y < 0.5
+                    || fb.y > 15.5
+                    || MAP[(fb.y as usize) * MAP_SIZE + (fb.x as usize)] > 0
+                {
                     fb.active = false; // Hits wall
                 }
             }
@@ -580,13 +681,16 @@ async fn main(spawner: Spawner) {
 
         // Imp Attack AI (Launches visible flying fireballs)
         for sprite in sprites.iter_mut() {
-            if sprite.hit_flash > 0 { sprite.hit_flash -= 1; }
+            if sprite.hit_flash > 0 {
+                sprite.hit_flash -= 1;
+            }
 
             if sprite.active && sprite.kind == 3 && !is_dead {
                 let dx = pos_x - sprite.x;
                 let dy = pos_y - sprite.y;
                 let dist_sq = dx * dx + dy * dy;
-                if dist_sq < 100.0 && dist_sq > 0.4 { // Within line of sight
+                if dist_sq < 100.0 && dist_sq > 0.4 {
+                    // Within line of sight
                     if sprite.cooldown > 0 {
                         sprite.cooldown -= 1;
                     } else {
@@ -619,14 +723,18 @@ async fn main(spawner: Spawner) {
             pos_y = PATROL_PATH[0].y;
             angle = 0.0;
             sprites = INITIAL_SPRITES;
-            for fb in fireballs.iter_mut() { fb.active = false; }
+            for fb in fireballs.iter_mut() {
+                fb.active = false;
+            }
         }
 
         // Pickups (Health Packs & Ammo Crates)
         let mut any_pickup_active = false;
         let mut any_enemy_active = false;
         for sprite in sprites.iter_mut() {
-            if sprite.kind == 3 && sprite.active { any_enemy_active = true; }
+            if sprite.kind == 3 && sprite.active {
+                any_enemy_active = true;
+            }
             if sprite.kind == 2 || sprite.kind == 4 {
                 if sprite.active {
                     any_pickup_active = true;
@@ -650,16 +758,24 @@ async fn main(spawner: Spawner) {
         // Respawn all sprites (enemies + pickups) if all cleared
         if !any_pickup_active || !any_enemy_active {
             respawn_timer += 1;
-            if respawn_timer > 500 { // Respawn after ~8 seconds
+            if respawn_timer > 500 {
+                // Respawn after ~8 seconds
                 for sprite in sprites.iter_mut() {
                     sprite.active = true;
-                    if sprite.kind == 3 { sprite.hp = 2; sprite.cooldown = 40; }
+                    if sprite.kind == 3 {
+                        sprite.hp = 2;
+                        sprite.cooldown = 40;
+                    }
                 }
                 respawn_timer = 0;
             }
         }
-        if pickup_flash_counter > 0 { pickup_flash_counter -= 1; }
-        if damage_flash_counter > 0 { damage_flash_counter -= 1; }
+        if pickup_flash_counter > 0 {
+            pickup_flash_counter -= 1;
+        }
+        if damage_flash_counter > 0 {
+            damage_flash_counter -= 1;
+        }
 
         let is_manual = manual_mode_timer > 0;
         let mut angle_diff = 0.0f32;
@@ -673,14 +789,25 @@ async fn main(spawner: Spawner) {
 
             let target_angle = libm::atan2f(dy, dx);
             angle_diff = target_angle - angle;
-            while angle_diff > core::f32::consts::PI { angle_diff -= core::f32::consts::TAU; }
-            while angle_diff < -core::f32::consts::PI { angle_diff += core::f32::consts::TAU; }
+            while angle_diff > core::f32::consts::PI {
+                angle_diff -= core::f32::consts::TAU;
+            }
+            while angle_diff < -core::f32::consts::PI {
+                angle_diff += core::f32::consts::TAU;
+            }
             angle += angle_diff * 0.08;
 
             if dist_to_target < 0.8 {
                 target_wpt_idx = (target_wpt_idx + 1) % PATROL_PATH.len();
             } else {
-                try_move(&mut pos_x, &mut pos_y, dir_x * 0.045, dir_y * 0.045, &MAP, MAP_SIZE);
+                try_move(
+                    &mut pos_x,
+                    &mut pos_y,
+                    dir_x * 0.045,
+                    dir_y * 0.045,
+                    &MAP,
+                    MAP_SIZE,
+                );
             }
             head_bob_time += 0.15;
         }
@@ -722,13 +849,19 @@ async fn main(spawner: Spawner) {
             |tile, tex_x, tex_y| {
                 // Authentic 1993 DOOM Wall Texture Generator (16×16 Bitmapped Patterns)
                 match tile {
-                    1 => { // Earthy Tan/Brown Brick Wall
+                    1 => {
+                        // Earthy Tan/Brown Brick Wall
                         let is_mortar = (tex_y % 4 == 0)
                             || ((tex_y / 4) % 2 == 0 && tex_x % 8 == 0)
                             || ((tex_y / 4) % 2 == 1 && (tex_x + 4) % 8 == 0);
-                        if is_mortar { Rgb565::new(6, 12, 6) } else { Rgb565::new(18, 14, 2) }
+                        if is_mortar {
+                            Rgb565::new(6, 12, 6)
+                        } else {
+                            Rgb565::new(18, 14, 2)
+                        }
                     }
-                    2 => { // Tech Blue Panel
+                    2 => {
+                        // Tech Blue Panel
                         if tex_y == 2 || tex_y == 14 || (tex_x == 8 && tex_y > 4 && tex_y < 12) {
                             Rgb565::new(0, 50, 25)
                         } else if tex_x == 0 || tex_x == 15 || tex_y == 0 || tex_y == 15 {
@@ -737,10 +870,16 @@ async fn main(spawner: Spawner) {
                             Rgb565::new(4, 16, 22)
                         }
                     }
-                    3 => { // Hazard Warning Stripe
-                        if (tex_x + tex_y) % 6 < 3 { Rgb565::YELLOW } else { Rgb565::new(2, 4, 2) }
+                    3 => {
+                        // Hazard Warning Stripe
+                        if (tex_x + tex_y) % 6 < 3 {
+                            Rgb565::YELLOW
+                        } else {
+                            Rgb565::new(2, 4, 2)
+                        }
                     }
-                    _ => { // Steel Blast Door
+                    _ => {
+                        // Steel Blast Door
                         if tex_x == 0 || tex_x == 15 || tex_y == 0 || tex_y == 15 {
                             Rgb565::new(16, 32, 16)
                         } else if tex_x >= 12 && tex_x <= 13 && tex_y >= 7 && tex_y <= 9 {
@@ -759,12 +898,27 @@ async fn main(spawner: Spawner) {
 
         // Build a unified RaycastSprite slice that covers world sprites + active fireballs.
         // Fireballs are encoded with texture_id = 255 to distinguish them from game sprites.
-        let mut rc_sprites = [RaycastSprite { x: 0.0, y: 0.0, texture_id: 0, active: false }; 13];
+        let mut rc_sprites = [RaycastSprite {
+            x: 0.0,
+            y: 0.0,
+            texture_id: 0,
+            active: false,
+        }; 13];
         for (i, s) in sprites.iter().enumerate() {
-            rc_sprites[i] = RaycastSprite { x: s.x, y: s.y, texture_id: s.kind, active: s.active };
+            rc_sprites[i] = RaycastSprite {
+                x: s.x,
+                y: s.y,
+                texture_id: s.kind,
+                active: s.active,
+            };
         }
         for (i, fb) in fireballs.iter().enumerate() {
-            rc_sprites[9 + i] = RaycastSprite { x: fb.x, y: fb.y, texture_id: 255, active: fb.active };
+            rc_sprites[9 + i] = RaycastSprite {
+                x: fb.x,
+                y: fb.y,
+                texture_id: 255,
+                active: fb.active,
+            };
         }
 
         raycaster.render_sprites_fast(
@@ -777,19 +931,24 @@ async fn main(spawner: Spawner) {
             framebuf,
             |rc_s, transform_y| {
                 if rc_s.texture_id == 255 {
-                    let shaded = apply_shade(Rgb565::new(31, 32, 0), 1.0 / (1.0 + transform_y * 0.2));
+                    let shaded =
+                        apply_shade(Rgb565::new(31, 32, 0), 1.0 / (1.0 + transform_y * 0.2));
                     return Some((shaded, false));
                 }
-                let game_sprite = sprites.iter().find(|s| s.active && s.kind == rc_s.texture_id
-                    && (s.x - rc_s.x).abs() < 0.01 && (s.y - rc_s.y).abs() < 0.01)?;
+                let game_sprite = sprites.iter().find(|s| {
+                    s.active
+                        && s.kind == rc_s.texture_id
+                        && (s.x - rc_s.x).abs() < 0.01
+                        && (s.y - rc_s.y).abs() < 0.01
+                })?;
                 let base_color = if game_sprite.hit_flash > 0 {
                     Rgb565::WHITE
                 } else {
                     match game_sprite.kind {
-                        1 => Rgb565::new(16, 40, 8),  // Toxic Green Barrel
-                        2 => Rgb565::GREEN,            // Health Pack
-                        3 => Rgb565::new(18, 10, 4),  // Ochre-Brown Imp
-                        _ => Rgb565::new(0, 36, 31),  // Steel Blue Ammo Crate
+                        1 => Rgb565::new(16, 40, 8), // Toxic Green Barrel
+                        2 => Rgb565::GREEN,          // Health Pack
+                        3 => Rgb565::new(18, 10, 4), // Ochre-Brown Imp
+                        _ => Rgb565::new(0, 36, 31), // Steel Blue Ammo Crate
                     }
                 };
                 let shade = (1.0 / (1.0 + transform_y * 0.2)).clamp(0.05, 1.0);
@@ -798,7 +957,10 @@ async fn main(spawner: Spawner) {
                 Some((shaded, is_imp))
             },
             |(shaded, is_imp), stripe_x, y, draw_start_y, draw_end_y| {
-                let pixel = if *is_imp && y >= draw_start_y + (draw_end_y - draw_start_y) / 6 && y <= draw_start_y + (draw_end_y - draw_start_y) / 4 {
+                let pixel = if *is_imp
+                    && y >= draw_start_y + (draw_end_y - draw_start_y) / 6
+                    && y <= draw_start_y + (draw_end_y - draw_start_y) / 4
+                {
                     Rgb565::RED
                 } else {
                     *shaded
@@ -832,13 +994,13 @@ async fn main(spawner: Spawner) {
         let weapon_y_start = (215 + weapon_bob + weapon_recoil).clamp(180, 248) as usize;
 
         let gun_metal = Rgb565::new(12, 14, 16);
-        let gun_dark  = Rgb565::new(5, 5, 5);
+        let gun_dark = Rgb565::new(5, 5, 5);
 
         for wy in weapon_y_start..VIEW3D_HEIGHT {
             let row = wy * VIEW_WIDTH;
             let width_at_y = 12 + ((wy - weapon_y_start) / 2) as i32;
             let wx_start = (weapon_x_center - width_at_y).clamp(0, 239) as usize;
-            let wx_end   = (weapon_x_center + width_at_y).clamp(0, 239) as usize;
+            let wx_end = (weapon_x_center + width_at_y).clamp(0, 239) as usize;
 
             for wx in wx_start..wx_end {
                 framebuf[row + wx] = if wx % 3 == 0 { gun_dark } else { gun_metal };
@@ -858,8 +1020,12 @@ async fn main(spawner: Spawner) {
                     let row = fy * VIEW_WIDTH;
                     let radius = (8 - (dy as i32 - 8).abs()) as usize;
                     let fx_start = flash_center_x.saturating_sub(radius);
-                    let fx_end   = (flash_center_x + radius).min(239);
-                    framebuf[row + fx_start..=row + fx_end].fill(if dy % 2 == 0 { flash_yellow } else { flash_orange });
+                    let fx_end = (flash_center_x + radius).min(239);
+                    framebuf[row + fx_start..=row + fx_end].fill(if dy % 2 == 0 {
+                        flash_yellow
+                    } else {
+                        flash_orange
+                    });
                 }
             }
         }
@@ -925,10 +1091,15 @@ async fn main(spawner: Spawner) {
                 hud_val_style
             };
 
-            let _ = Text::with_baseline("AMMO",     Point::new(3,  ty), hud_text_style, Baseline::Top).draw(&mut fb);
-            let _ = Text::with_baseline(ammo_str,   Point::new(3,  vy), val_style,      Baseline::Top).draw(&mut fb);
-            let _ = Text::with_baseline("HEALTH",   Point::new(52, ty), hud_text_style, Baseline::Top).draw(&mut fb);
-            let _ = Text::with_baseline(health_str, Point::new(52, vy), val_style,      Baseline::Top).draw(&mut fb);
+            let _ = Text::with_baseline("AMMO", Point::new(3, ty), hud_text_style, Baseline::Top)
+                .draw(&mut fb);
+            let _ = Text::with_baseline(ammo_str, Point::new(3, vy), val_style, Baseline::Top)
+                .draw(&mut fb);
+            let _ =
+                Text::with_baseline("HEALTH", Point::new(52, ty), hud_text_style, Baseline::Top)
+                    .draw(&mut fb);
+            let _ = Text::with_baseline(health_str, Point::new(52, vy), val_style, Baseline::Top)
+                .draw(&mut fb);
         }
 
         // B. DOOM Guy Face — centered at x=106 (face 28px wide)
@@ -939,19 +1110,29 @@ async fn main(spawner: Spawner) {
             let row = fy * VIEW_WIDTH;
             framebuf[row + face_box_x..row + face_box_x + 28].fill(face_bg);
         }
-        let eye_offset = if angle_diff > 0.05 { 2i32 } else if angle_diff < -0.05 { -2 } else { 0 };
-        let skin_color  = Rgb565::new(28, 20, 16);
-        let eye_color   = if is_dead || damage_flash_counter > 0 || muzzle_flash_counter > 0 { Rgb565::RED } else { Rgb565::WHITE };
+        let eye_offset = if angle_diff > 0.05 {
+            2i32
+        } else if angle_diff < -0.05 {
+            -2
+        } else {
+            0
+        };
+        let skin_color = Rgb565::new(28, 20, 16);
+        let eye_color = if is_dead || damage_flash_counter > 0 || muzzle_flash_counter > 0 {
+            Rgb565::RED
+        } else {
+            Rgb565::WHITE
+        };
         let pupil_color = Rgb565::BLACK;
         for fy in (face_box_y + 8)..(face_box_y + 44) {
             let row = fy * VIEW_WIDTH;
             framebuf[row + face_box_x + 4..row + face_box_x + 24].fill(skin_color);
         }
-        let eye_y   = face_box_y + 18;
+        let eye_y = face_box_y + 18;
         let eye_row = eye_y * VIEW_WIDTH;
         framebuf[eye_row + face_box_x + 6..eye_row + face_box_x + 10].fill(eye_color);
         framebuf[eye_row + face_box_x + 16..eye_row + face_box_x + 20].fill(eye_color);
-        let px1 = (face_box_x as i32 + 7  + eye_offset) as usize;
+        let px1 = (face_box_x as i32 + 7 + eye_offset) as usize;
         let px2 = (face_box_x as i32 + 17 + eye_offset) as usize;
         framebuf[eye_row + px1] = pupil_color;
         framebuf[eye_row + px2] = pupil_color;
@@ -963,7 +1144,8 @@ async fn main(spawner: Spawner) {
         } else if muzzle_flash_counter > 0 {
             framebuf[mouth_row + face_box_x + 8..mouth_row + face_box_x + 20].fill(Rgb565::WHITE);
         } else if damage_flash_counter > 0 {
-            framebuf[mouth_row + face_box_x + 6..mouth_row + face_box_x + 22].fill(Rgb565::new(31, 10, 0));
+            framebuf[mouth_row + face_box_x + 6..mouth_row + face_box_x + 22]
+                .fill(Rgb565::new(31, 10, 0));
         } else {
             framebuf[mouth_row + face_box_x + 8..mouth_row + face_box_x + 20].fill(Rgb565::RED);
         }
@@ -982,12 +1164,36 @@ async fn main(spawner: Spawner) {
 
             let mut fb = FramebufDrawTarget::new(framebuf, VIEW_WIDTH, VIEW_HEIGHT);
             let death_title_style = MonoTextStyle::new(&FONT_6X10, Rgb565::WHITE);
-            let death_sub_style   = MonoTextStyle::new(&FONT_6X10, Rgb565::YELLOW);
+            let death_sub_style = MonoTextStyle::new(&FONT_6X10, Rgb565::YELLOW);
 
-            let _ = Text::with_baseline("================================", Point::new(24,  90), death_title_style, Baseline::Top).draw(&mut fb);
-            let _ = Text::with_baseline("YOU DIED!",                    Point::new(93, 105), death_title_style, Baseline::Top).draw(&mut fb);
-            let _ = Text::with_baseline("TAP TO RESPAWN",                Point::new(78, 122), death_sub_style,   Baseline::Top).draw(&mut fb);
-            let _ = Text::with_baseline("================================", Point::new(24, 137), death_title_style, Baseline::Top).draw(&mut fb);
+            let _ = Text::with_baseline(
+                "================================",
+                Point::new(24, 90),
+                death_title_style,
+                Baseline::Top,
+            )
+            .draw(&mut fb);
+            let _ = Text::with_baseline(
+                "YOU DIED!",
+                Point::new(93, 105),
+                death_title_style,
+                Baseline::Top,
+            )
+            .draw(&mut fb);
+            let _ = Text::with_baseline(
+                "TAP TO RESPAWN",
+                Point::new(78, 122),
+                death_sub_style,
+                Baseline::Top,
+            )
+            .draw(&mut fb);
+            let _ = Text::with_baseline(
+                "================================",
+                Point::new(24, 137),
+                death_title_style,
+                Baseline::Top,
+            )
+            .draw(&mut fb);
         }
 
         // C. MODE label — right of face (x=140)
@@ -996,8 +1202,11 @@ async fn main(spawner: Spawner) {
             let mode_str = if is_manual { "MANUAL" } else { " AUTO " };
             let ty = (HUD_Y + 6) as i32;
             let vy = (HUD_Y + 20) as i32;
-            let _ = Text::with_baseline("MODE",   Point::new(140, ty), hud_text_style, Baseline::Top).draw(&mut fb);
-            let _ = Text::with_baseline(mode_str, Point::new(140, vy), hud_val_style,  Baseline::Top).draw(&mut fb);
+            let _ = Text::with_baseline("MODE", Point::new(140, ty), hud_text_style, Baseline::Top)
+                .draw(&mut fb);
+            let _ =
+                Text::with_baseline(mode_str, Point::new(140, vy), hud_val_style, Baseline::Top)
+                    .draw(&mut fb);
         }
 
         // D. Minimap — right side of HUD (x=186..234, y=HUD_Y+4..HUD_Y+52)
@@ -1037,16 +1246,18 @@ async fn main(spawner: Spawner) {
         let player_py = (mini_y + (pos_y * MINI_SCALE as f32) as usize)
             .clamp(mini_y, mini_y + 16 * MINI_SCALE - 2);
         let pr = player_py * VIEW_WIDTH + player_px;
-        framebuf[pr]     = Rgb565::RED;
+        framebuf[pr] = Rgb565::RED;
         framebuf[pr + 1] = Rgb565::RED;
         let pr2 = (player_py + 1) * VIEW_WIDTH + player_px;
-        framebuf[pr2]     = Rgb565::RED;
+        framebuf[pr2] = Rgb565::RED;
         framebuf[pr2 + 1] = Rgb565::RED;
         // Direction arrow — negate dir_x contribution to match the mirrored x axis
         let dir_px = (player_px as i32 - (dir_x * 4.0) as i32)
-            .clamp(mini_x as i32, (mini_x + 16 * MINI_SCALE - 1) as i32) as usize;
+            .clamp(mini_x as i32, (mini_x + 16 * MINI_SCALE - 1) as i32)
+            as usize;
         let dir_py = (player_py as i32 + (dir_y * 4.0) as i32)
-            .clamp(mini_y as i32, (mini_y + 16 * MINI_SCALE - 1) as i32) as usize;
+            .clamp(mini_y as i32, (mini_y + 16 * MINI_SCALE - 1) as i32)
+            as usize;
         framebuf[dir_py * VIEW_WIDTH + dir_px] = Rgb565::YELLOW;
 
         last_raycast_us = raycast_start.elapsed().as_micros();
@@ -1057,8 +1268,14 @@ async fn main(spawner: Spawner) {
         let blit_start = Instant::now();
 
         // Always update 3D Viewport (y = 0..256)
-        let view3d_area = Rectangle::new(Point::new(0, 0), Size::new(VIEW_WIDTH as u32, VIEW3D_HEIGHT as u32));
-        let _ = display.fill_contiguous(&view3d_area, framebuf[..VIEW_WIDTH * VIEW3D_HEIGHT].iter().copied());
+        let view3d_area = Rectangle::new(
+            Point::new(0, 0),
+            Size::new(VIEW_WIDTH as u32, VIEW3D_HEIGHT as u32),
+        );
+        let _ = display.fill_contiguous(
+            &view3d_area,
+            framebuf[..VIEW_WIDTH * VIEW3D_HEIGHT].iter().copied(),
+        );
 
         // Update HUD (y = 256..320) on frame 0, when HUD status changes, or every 3 frames
         let hud_needs_update = frame_count == 0
@@ -1073,7 +1290,10 @@ async fn main(spawner: Spawner) {
                 Point::new(0, VIEW3D_HEIGHT as i32),
                 Size::new(VIEW_WIDTH as u32, (VIEW_HEIGHT - VIEW3D_HEIGHT) as u32),
             );
-            let _ = display.fill_contiguous(&hud_area, framebuf[VIEW_WIDTH * VIEW3D_HEIGHT..].iter().copied());
+            let _ = display.fill_contiguous(
+                &hud_area,
+                framebuf[VIEW_WIDTH * VIEW3D_HEIGHT..].iter().copied(),
+            );
         }
 
         last_blit_us = blit_start.elapsed().as_micros();
@@ -1082,8 +1302,14 @@ async fn main(spawner: Spawner) {
         frame_count += 1;
 
         if frame_count % 60 == 0 {
-            defmt::info!("DOOM Demo Frame {}: Total {}ms (Raycast: {}us, DMA Blit: {}us, FPS: {})",
-                frame_count, last_total_ms, last_raycast_us, last_blit_us, 1000 / last_total_ms.max(1));
+            defmt::info!(
+                "DOOM Demo Frame {}: Total {}ms (Raycast: {}us, DMA Blit: {}us, FPS: {})",
+                frame_count,
+                last_total_ms,
+                last_raycast_us,
+                last_blit_us,
+                1000 / last_total_ms.max(1)
+            );
         }
 
         ticker.next().await;
