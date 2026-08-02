@@ -510,6 +510,10 @@ async fn main(spawner: Spawner) {
     loop {
         let frame_start = Instant::now();
 
+        if frame_count == 0 {
+            defmt::info!("Loop start: frame 0");
+        }
+
         let framebuf = unsafe {
             if use_buf_a {
                 &mut (*RAW_FRAMEBUF_A.0.get()).0
@@ -519,11 +523,12 @@ async fn main(spawner: Spawner) {
         };
         use_buf_a = !use_buf_a;
 
-        // --------------------------------------------------------------------
-        // 1. Physical 3-Button FPS Controls (B1: Left, B2: Forward, B3: Right)
-        // --------------------------------------------------------------------
         let dir_x = cosf(angle);
         let dir_y = sinf(angle);
+
+        if frame_count == 0 {
+            defmt::info!("Trig ok: dir_x={}, dir_y={}", dir_x, dir_y);
+        }
 
         // Camera plane for 66-degree FOV
         let fov_scale = 0.66f32;
@@ -838,6 +843,10 @@ async fn main(spawner: Spawner) {
             Rgb565::new(4, 8, 14),  // ceil_b
             framebuf_u32,
         );
+
+        if frame_count == 0 {
+            defmt::info!("Mode7 done");
+        }
 
         // --------------------------------------------------------------------
         // 2.5 DDA 3D Wall Column Rendering (embedded-3dgfx textured variant)
