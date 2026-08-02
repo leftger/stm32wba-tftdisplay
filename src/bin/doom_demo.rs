@@ -530,7 +530,7 @@ async fn main(_spawner: Spawner) {
             core::slice::from_raw_parts_mut(framebuf.as_mut_ptr() as *mut u32, VIEW_PIXELS / 2)
         };
 
-        mode7.render_floor_and_ceiling(
+        mode7.render_floor_and_ceiling_fast(
             pos_x,
             pos_y,
             angle,
@@ -602,7 +602,7 @@ async fn main(_spawner: Spawner) {
             rc_sprites[9 + i] = RaycastSprite { x: fb.x, y: fb.y, texture_id: 255, active: fb.active };
         }
 
-        raycaster.render_sprites(
+        raycaster.render_sprites_fast(
             pos_x,
             pos_y,
             angle,
@@ -610,43 +610,36 @@ async fn main(_spawner: Spawner) {
             &rc_sprites,
             &z_buffer,
             framebuf,
-            |rc_s, norm_y| {
-                // Look up the original game sprite to get hit_flash state
-                let game_sprite = if rc_s.texture_id == 255 {
-                    // Fireball
-                    return Some(Rgb565::new(31, 32, 0));
+            |rc_s, transform_y| {
+                if rc_s.texture_id == 255 {
+                    let shaded = apply_shade(Rgb565::new(31, 32, 0), 1.0 / (1.0 + transform_y * 0.2));
+                    return Some((shaded, false));
+                }
+                let game_sprite = sprites.iter().find(|s| s.active && s.kind == rc_s.texture_id
+                    && (s.x - rc_s.x).abs() < 0.01 && (s.y - rc_s.y).abs() < 0.01)?;
+                let base_color = if game_sprite.hit_flash > 0 {
+                    Rgb565::WHITE
                 } else {
-                    sprites.iter().find(|s| s.active && s.kind == rc_s.texture_id
-                        && (s.x - rc_s.x).abs() < 0.01 && (s.y - rc_s.y).abs() < 0.01)
+                    match game_sprite.kind {
+                        1 => Rgb565::new(16, 40, 8),  // Toxic Green Barrel
+                        2 => Rgb565::GREEN,            // Health Pack
+                        3 => Rgb565::new(18, 10, 4),  // Ochre-Brown Imp
+                        _ => Rgb565::new(0, 36, 31),  // Steel Blue Ammo Crate
+                    }
                 };
-
-                let dist = libm::sqrtf(
-                    (rc_s.x - pos_x) * (rc_s.x - pos_x) + (rc_s.y - pos_y) * (rc_s.y - pos_y)
-                );
-                let shade = (1.0 / (1.0 + dist * 0.2)).clamp(0.05, 1.0);
-
-                if let Some(sp) = game_sprite {
-                    let base_color = if sp.hit_flash > 0 {
-                        Rgb565::WHITE
-                    } else {
-                        match sp.kind {
-                            1 => Rgb565::new(16, 40, 8),  // Toxic Green Barrel
-                            2 => Rgb565::GREEN,            // Health Pack
-                            3 => Rgb565::new(18, 10, 4),  // Ochre-Brown Imp
-                            _ => Rgb565::new(0, 36, 31),  // Steel Blue Ammo Crate
-                        }
-                    };
-                    let shaded = apply_shade(base_color, shade);
-                    // Imp red eye detail in the upper quarter
-                    let pixel = if sp.kind == 3 && sp.hit_flash == 0 && norm_y >= 1.0/6.0 && norm_y <= 1.0/4.0 {
-                        Rgb565::RED
-                    } else {
-                        shaded
-                    };
-                    // Checkerboard dither for transparency effect
-                    let sx = (rc_s.x * 100.0) as usize;
-                    let sy = (norm_y * 100.0) as usize;
-                    if (sx + sy) % 2 == 0 { Some(pixel) } else { None }
+                let shade = (1.0 / (1.0 + transform_y * 0.2)).clamp(0.05, 1.0);
+                let shaded = apply_shade(base_color, shade);
+                let is_imp = game_sprite.kind == 3 && game_sprite.hit_flash == 0;
+                Some((shaded, is_imp))
+            },
+            |(shaded, is_imp), stripe_x, y, draw_start_y, draw_end_y| {
+                let pixel = if *is_imp && y >= draw_start_y + (draw_end_y - draw_start_y) / 6 && y <= draw_start_y + (draw_end_y - draw_start_y) / 4 {
+                    Rgb565::RED
+                } else {
+                    *shaded
+                };
+                if (stripe_x + y) % 2 == 0 {
+                    Some(pixel)
                 } else {
                     None
                 }
