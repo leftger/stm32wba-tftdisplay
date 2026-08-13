@@ -49,18 +49,20 @@ Connect the **Adafruit TDK InvenSense ICM-20948 9-DoF IMU** breakout to the NUCL
 
 ## 🎨 3D Engine & Features
 
-- **3D Renderer**: `embedded-3dgfx` v0.4.1 (with `row_width_240` and `depth-u16` features optimized for 128KB SRAM)
+- **3D Renderer**: `embedded-3dgfx` v0.5 (slim features: `row_width_320` / `depth-u16`, plus per-bin gates)
 - **Display Driver**: `mipidsi` v0.9 + `embedded-hal-bus::spi::ExclusiveDevice`
-- **Math Library**: `nalgebra` v0.34
+- **Math Library**: `nalgebra` v0.35
 - **Animations**:
   - Continuous 3D rotation (Roll, Pitch, Yaw) across multiple 3D meshes (Cube and Octahedron).
   - Dynamic palette color cycling (Cyan, Magenta, Yellow, Green, Red, White).
   - Render mode transitions (Wireframe Lines, Point Cloud, Solid Triangles).
   - Real-time 2D HUD text overlay using `embedded-graphics`.
 
----
+### Mesh / normal input contract
 
----
+Lit render modes in `embedded-3dgfx` expect **face normals** in `Geometry::normals` (one per triangle) and optional **vertex normals** in `Geometry::vertex_normals` (one per vertex, for Gouraud). Feeding only vertex normals leaves solid/lit modes blank while wireframe still works.
+
+See **[docs/geometry.md](docs/geometry.md)** for field meanings, winding, double-sided meshes, and per-`RenderMode` requirements.
 
 ## 🎮 Executable Demos
 
@@ -68,14 +70,22 @@ Connect the **Adafruit TDK InvenSense ICM-20948 9-DoF IMU** breakout to the NUCL
 - Real-time 3D rigid-body physics, mesh rotations, color cycling, and HUD metrics running at ~85 FPS.
 - Flash & Run:
   ```bash
-  cargo run --release --bin stm32wba-tftdisplay
+  cargo run --release --bin stm32wba-tftdisplay --features physics
   ```
 
 ### 2. DOOM E1M1-Inspired 3D Level Walkthrough Demo (`doom_demo`)
 - DDA Fast Raycasting 3D engine with 16x16 E1M1 map layout, wall height projection, distance lighting attenuation, depth-sorted 3D billboarded sprites (Barrels, Health Kits, Imp Enemies), animated DOOM Guy status avatar, radar minimap, and weapon recoil.
 - Flash & Run:
   ```bash
-  cargo run --release --bin doom_demo
+  cargo run --release --bin doom_demo --features doom
+  ```
+
+### 3. Madgwick / VQF Orientation Sync Demo (`orientation_demo`)
+- ICM-20948-driven spacecraft mesh with VQF (default) or Madgwick AHRS, lit render-mode cycle, and toon ink overlay.
+- Geometry for this demo follows the face-normal contract in [docs/geometry.md](docs/geometry.md).
+- Flash & Run:
+  ```bash
+  cargo run --release --bin orientation_demo --features lighting
   ```
 
 ---
@@ -84,7 +94,10 @@ Connect the **Adafruit TDK InvenSense ICM-20948 9-DoF IMU** breakout to the NUCL
 
 ### Build Release Binaries
 ```bash
-cargo build --release --bins
+# Each bin declares required-features; build them individually:
+cargo build --release --bin stm32wba-tftdisplay --features physics
+cargo build --release --bin orientation_demo --features lighting
+cargo build --release --bin doom_demo --features doom
 ```
 
 ### Flash with Probe-rs

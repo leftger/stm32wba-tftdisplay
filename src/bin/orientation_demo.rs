@@ -41,8 +41,7 @@ use embedded_3dgfx::config::{apply_default_caps, MaterialProfile};
 use embedded_3dgfx::mesh::{Geometry, K3dMesh, RenderMode};
 use embedded_3dgfx::renderer::FrameCtx;
 use embedded_3dgfx::K3dengine;
-use nalgebra::{Point3, Vector3};
-use nalgebra_uf::Vector3 as UfVec3;
+use nalgebra::{Point3, UnitQuaternion, Vector3, Quaternion};
 use uf_ahrs::{Ahrs, Vqf, VqfParams};
 
 bind_interrupts!(struct Irqs {
@@ -450,13 +449,13 @@ fn relative_euler(q: [f32; 4], reference: [f32; 4]) -> (f32, f32, f32) {
     euler_from_quat(quat_mul(inv_ref, q))
 }
 
-fn quat_from_uf(q: nalgebra_uf::UnitQuaternion<f32>) -> [f32; 4] {
+fn quat_from_uf(q: UnitQuaternion<f32>) -> [f32; 4] {
     let q = q.quaternion();
     [q.w, q.i, q.j, q.k]
 }
 
-fn uf_identity() -> nalgebra_uf::UnitQuaternion<f32> {
-    nalgebra_uf::UnitQuaternion::new_unchecked(nalgebra_uf::Quaternion::new(1.0, 0.0, 0.0, 0.0))
+fn uf_identity() -> UnitQuaternion<f32> {
+    UnitQuaternion::new_unchecked(Quaternion::new(1.0, 0.0, 0.0, 0.0))
 }
 
 // ----------------------------------------------------------------------------
@@ -869,10 +868,10 @@ async fn main(_spawner: Spawner) {
                             // Scale gyro so VQF's fixed VQF_DT integration matches
                             // the real elapsed frame time.
                             let scale = dt / VQF_DT;
-                            let gyr = UfVec3::new(gyro.x * scale, gyro.y * scale, gyro.z * scale);
-                            let acc = UfVec3::new(accel.x, accel.y, accel.z);
+                            let gyr = Vector3::new(gyro.x * scale, gyro.y * scale, gyro.z * scale);
+                            let acc = Vector3::new(accel.x, accel.y, accel.z);
                             if mag.is_some() {
-                                let mag_v = UfVec3::new(mx, my, mz);
+                                let mag_v = Vector3::new(mx, my, mz);
                                 vqf.update(gyr, acc, mag_v);
                             } else {
                                 vqf.update_imu(gyr, acc);

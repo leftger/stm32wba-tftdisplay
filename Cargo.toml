@@ -6,15 +6,28 @@ edition = "2021"
 [[bin]]
 name = "stm32wba-tftdisplay"
 path = "src/main.rs"
+required-features = ["physics"]
 
 [[bin]]
 name = "doom_demo"
 path = "src/bin/doom_demo.rs"
+required-features = ["doom"]
 
 [[bin]]
 name = "orientation_demo"
 path = "src/bin/orientation_demo.rs"
+required-features = ["lighting"]
 
+[features]
+default = []
+# Forwarded embedded-3dgfx 0.5 feature gates (slim engine default is MCU-oriented).
+lighting = ["embedded-3dgfx/lighting"]
+physics = ["embedded-3dgfx/physics"]
+raycast = ["embedded-3dgfx/raycast"]
+hud = ["embedded-3dgfx/hud"]
+textured = ["embedded-3dgfx/textured"]
+# Convenience bundle for the Doom raycast demo.
+doom = ["lighting", "textured", "raycast", "hud"]
 
 [dependencies]
 embassy-stm32 = { git = "https://github.com/embassy-rs/embassy", branch = "main", features = ["stm32wba65ri", "memory-x", "time-driver-any", "usb-host", "exti"] }
@@ -37,11 +50,10 @@ display-interface = "0.5.0"
 display-interface-spi = "0.5.0"
 mipidsi = "0.9.0"
 
-embedded-3dgfx = { git = "https://github.com/leftger/embedded-3dgfx", branch = "master", default-features = false, features = ["row_width_320", "depth-u16", "physics"] }
-nalgebra = { version = "0.34", default-features = false, features = ["libm"] }
-# uf-ahrs pulls nalgebra 0.35; keep an explicit alias so we can build its Vector3
-# inputs without colliding with the 0.34 types used by embedded-3dgfx.
-nalgebra-uf = { package = "nalgebra", version = "0.35", default-features = false, features = ["libm"] }
+# 0.5 slim features: pick bin features (`lighting` / `physics` / `doom`) explicitly.
+embedded-3dgfx = { git = "https://github.com/leftger/embedded-3dgfx", branch = "feature/slim-features-0.5", default-features = false, features = ["row_width_320", "depth-u16"] }
+# Match embedded-3dgfx 0.5 (nalgebra 0.35). uf-ahrs uses the same major.
+nalgebra = { version = "0.35", default-features = false, features = ["libm"] }
 libm = "0.2.11"
 uf-ahrs = "0.2.1"
 
