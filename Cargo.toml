@@ -39,7 +39,11 @@ mipidsi = "0.9.0"
 
 embedded-3dgfx = { git = "https://github.com/leftger/embedded-3dgfx", branch = "master", default-features = false, features = ["row_width_320", "depth-u16", "physics"] }
 nalgebra = { version = "0.34", default-features = false, features = ["libm"] }
+# uf-ahrs pulls nalgebra 0.35; keep an explicit alias so we can build its Vector3
+# inputs without colliding with the 0.34 types used by embedded-3dgfx.
+nalgebra-uf = { package = "nalgebra", version = "0.35", default-features = false, features = ["libm"] }
 libm = "0.2.11"
+uf-ahrs = "0.2.1"
 
 [build-dependencies]
 cortex-m-rt = "0.7.5"

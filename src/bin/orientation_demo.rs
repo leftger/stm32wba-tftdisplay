@@ -42,6 +42,8 @@ use embedded_3dgfx::mesh::{Geometry, K3dMesh, RenderMode};
 use embedded_3dgfx::renderer::FrameCtx;
 use embedded_3dgfx::K3dengine;
 use nalgebra::{Point3, Vector3};
+use nalgebra_uf::Vector3 as UfVec3;
+use uf_ahrs::{Ahrs, Vqf, VqfParams};
 
 bind_interrupts!(struct Irqs {
     GPDMA1_CHANNEL0 => InterruptHandler<peripherals::GPDMA1_CH0>;
@@ -382,10 +384,38 @@ impl MadgwickFilter {
     /// Composing quaternions keeps the re-zero valid at any attitude; subtracting
     /// Euler angles independently breaks down near vertical pitch.
     pub fn relative_euler(&self, reference: [f32; 4]) -> (f32, f32, f32) {
-        let inv_ref = [reference[0], -reference[1], -reference[2], -reference[3]];
-        euler_from_quat(quat_mul(inv_ref, self.q))
+        relative_euler(self.q, reference)
     }
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AhrsBackend {
+    Vqf,
+    Madgwick,
+}
+
+impl AhrsBackend {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Vqf => "VQF",
+            Self::Madgwick => "MADGWICK",
+        }
+    }
+
+    fn toggle(self) -> Self {
+        match self {
+            Self::Vqf => Self::Madgwick,
+            Self::Madgwick => Self::Vqf,
+        }
+    }
+}
+
+/// Nominal sample period baked into the VQF instance. Real frame time varies, so
+/// gyroscope inputs are scaled by `dt / VQF_DT` to keep integration correct
+/// without rebuilding (and wiping) the filter's bias / LPF state each frame.
+const VQF_DT: f32 = 0.05;
+/// ~1 s hold at ~20 FPS.
+const B3_LONG_PRESS_FRAMES: u8 = 20;
 
 fn quat_mul(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
     [
@@ -413,6 +443,20 @@ fn euler_from_quat(q: [f32; 4]) -> (f32, f32, f32) {
     let yaw = atan2f(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z));
 
     (pitch, roll, yaw)
+}
+
+fn relative_euler(q: [f32; 4], reference: [f32; 4]) -> (f32, f32, f32) {
+    let inv_ref = [reference[0], -reference[1], -reference[2], -reference[3]];
+    euler_from_quat(quat_mul(inv_ref, q))
+}
+
+fn quat_from_uf(q: nalgebra_uf::UnitQuaternion<f32>) -> [f32; 4] {
+    let q = q.quaternion();
+    [q.w, q.i, q.j, q.k]
+}
+
+fn uf_identity() -> nalgebra_uf::UnitQuaternion<f32> {
+    nalgebra_uf::UnitQuaternion::new_unchecked(nalgebra_uf::Quaternion::new(1.0, 0.0, 0.0, 0.0))
 }
 
 // ----------------------------------------------------------------------------
@@ -630,10 +674,20 @@ async fn main(_spawner: Spawner) {
         false
     };
 
-    // Madgwick's reference beta is ~0.033-0.1. Higher values chase accelerometer
-    // spikes, which during hand motion are linear acceleration, not gravity.
-    let mut madgwick = MadgwickFilter::new(0.1);
+    // Madgwick paper default: beta = sqrt(3/4) * gyroMeasError, with
+    // gyroMeasError = 5 deg/s ≈ 0.0873 rad/s → beta ≈ 0.0756.
+    let mut madgwick = MadgwickFilter::new(0.076);
+    // VQF is the default absolute-heading filter. Online gyro bias estimation
+    // (motion + rest) is enabled explicitly; rest_threshold_gyro is stored in
+    // rad/s for this crate, so convert the paper's 2 °/s default.
+    let mut vqf_params = VqfParams::default();
+    vqf_params.do_bias_estimation = true;
+    vqf_params.do_rest_bias_estimation = true;
+    vqf_params.rest_threshold_gyro = 2.0f32.to_radians();
+    let mut vqf = Vqf::new(core::time::Duration::from_secs_f32(VQF_DT), vqf_params);
+    let mut ahrs_backend = AhrsBackend::Vqf;
     let mut zero_ref = [1.0f32, 0.0, 0.0, 0.0];
+    let mut attitude_q = [1.0f32, 0.0, 0.0, 0.0];
 
     let mut engine = K3dengine::new(VIEW_WIDTH as u16, VIEW_HEIGHT as u16);
     apply_default_caps(&mut engine);
@@ -693,6 +747,8 @@ async fn main(_spawner: Spawner) {
     let mut b2_was_pressed = false;
     let mut b3_was_pressed = false;
     let mut b1_cooldown = 0u8;
+    let mut b3_hold_frames = 0u8;
+    let mut b3_long_handled = false;
 
     let text_style = MonoTextStyle::new(&FONT_6X10, Rgb565::CYAN);
     let val_style = MonoTextStyle::new(&FONT_6X10, Rgb565::YELLOW);
@@ -733,20 +789,39 @@ async fn main(_spawner: Spawner) {
 
         let b2_pressed = btn2.is_low();
         if b2_pressed && !b2_was_pressed {
-            zero_ref = madgwick.q;
+            zero_ref = attitude_q;
             defmt::info!("Attitude re-zeroed to current orientation");
         }
         b2_was_pressed = b2_pressed;
 
         let b3_pressed = btn3.is_low();
-        if b3_pressed && !b3_was_pressed {
-            madgwick.reset();
-            zero_ref = [1.0, 0.0, 0.0, 0.0];
-            defmt::info!("Madgwick filter reset");
+        if b3_pressed {
+            if b3_hold_frames < u8::MAX {
+                b3_hold_frames += 1;
+            }
+            if !b3_long_handled && b3_hold_frames >= B3_LONG_PRESS_FRAMES {
+                ahrs_backend = ahrs_backend.toggle();
+                madgwick.reset();
+                vqf.set_orientation(uf_identity());
+                zero_ref = [1.0, 0.0, 0.0, 0.0];
+                attitude_q = [1.0, 0.0, 0.0, 0.0];
+                b3_long_handled = true;
+                defmt::info!("AHRS backend -> {}", ahrs_backend.name());
+            }
+        } else if b3_was_pressed {
+            if !b3_long_handled {
+                madgwick.reset();
+                vqf.set_orientation(uf_identity());
+                zero_ref = [1.0, 0.0, 0.0, 0.0];
+                attitude_q = [1.0, 0.0, 0.0, 0.0];
+                defmt::info!("{} filter reset", ahrs_backend.name());
+            }
+            b3_hold_frames = 0;
+            b3_long_handled = false;
         }
         b3_was_pressed = b3_pressed;
 
-        // 2. Poll IMU & Execute Madgwick AHRS Filter Update
+        // 2. Poll IMU & update the active AHRS filter
         let now = Instant::now();
         // Clamped so a startup stall or one-off hitch can't feed a huge step
         // into the integrator.
@@ -757,37 +832,53 @@ async fn main(_spawner: Spawner) {
         if imu_ok {
             match (imu.read_accelerometer(), imu.read_gyroscope_radians()) {
                 (Ok(accel), Ok(gyro)) => {
-                    if mag_ok {
+                    let mag = if mag_ok {
                         match imu.read_magnetometer() {
-                            Ok(mag) => {
-                                // AK09916 axes are remapped to the ICM-20948
-                                // accel/gyro body frame (Y/Z inverted).
-                                madgwick.update_9dof(
-                                    gyro.x,
-                                    gyro.y,
-                                    gyro.z,
-                                    accel.x,
-                                    accel.y,
-                                    accel.z,
-                                    mag.x,
-                                    -mag.y,
-                                    -mag.z,
-                                    dt,
-                                );
-                            }
+                            Ok(m) => Some(m),
                             Err(_) => {
-                                madgwick.update_6dof(
-                                    gyro.x, gyro.y, gyro.z, accel.x, accel.y, accel.z, dt,
-                                );
                                 if frame_count % 60 == 0 {
-                                    defmt::warn!("IMU Mag Read Error; using 6-DoF fallback");
+                                    defmt::warn!("IMU Mag Read Error; IMU-only update");
                                 }
+                                None
                             }
                         }
                     } else {
-                        madgwick.update_6dof(
-                            gyro.x, gyro.y, gyro.z, accel.x, accel.y, accel.z, dt,
-                        );
+                        None
+                    };
+
+                    // AK09916 axes remapped into the ICM-20948 accel/gyro body frame.
+                    let (mx, my, mz) = mag
+                        .map(|m| (m.x, -m.y, -m.z))
+                        .unwrap_or((0.0, 0.0, 0.0));
+
+                    match ahrs_backend {
+                        AhrsBackend::Madgwick => {
+                            if mag.is_some() {
+                                madgwick.update_9dof(
+                                    gyro.x, gyro.y, gyro.z, accel.x, accel.y, accel.z, mx, my, mz,
+                                    dt,
+                                );
+                            } else {
+                                madgwick.update_6dof(
+                                    gyro.x, gyro.y, gyro.z, accel.x, accel.y, accel.z, dt,
+                                );
+                            }
+                            attitude_q = madgwick.q;
+                        }
+                        AhrsBackend::Vqf => {
+                            // Scale gyro so VQF's fixed VQF_DT integration matches
+                            // the real elapsed frame time.
+                            let scale = dt / VQF_DT;
+                            let gyr = UfVec3::new(gyro.x * scale, gyro.y * scale, gyro.z * scale);
+                            let acc = UfVec3::new(accel.x, accel.y, accel.z);
+                            if mag.is_some() {
+                                let mag_v = UfVec3::new(mx, my, mz);
+                                vqf.update(gyr, acc, mag_v);
+                            } else {
+                                vqf.update_imu(gyr, acc);
+                            }
+                            attitude_q = quat_from_uf(vqf.orientation());
+                        }
                     }
                 }
                 (Err(_e_a), _) => {
@@ -803,21 +894,32 @@ async fn main(_spawner: Spawner) {
             }
         }
 
-        let (pitch, roll, yaw) = madgwick.relative_euler(zero_ref);
+        let (pitch, roll, yaw) = relative_euler(attitude_q, zero_ref);
 
         let pitch_deg = (pitch * (180.0 / core::f32::consts::PI)) as i32;
         let roll_deg = (roll * (180.0 / core::f32::consts::PI)) as i32;
         let yaw_deg = (yaw * (180.0 / core::f32::consts::PI)) as i32;
 
         if frame_count % 60 == 0 {
+            let bias = vqf.state.bias;
+            let bias_dps = (
+                bias.x.to_degrees(),
+                bias.y.to_degrees(),
+                bias.z.to_degrees(),
+            );
             defmt::info!(
-                "AHRS | Pitch={}° Roll={}° Yaw={}° | dt={}ms mag={} gyro_bias={}",
+                "{} | Pitch={}° Roll={}° Yaw={}° | dt={}ms mag={} gyro_bias={} rest={} online_bias=[{}, {}, {}]dps",
+                ahrs_backend.name(),
                 pitch_deg,
                 roll_deg,
                 yaw_deg,
                 (dt_avg * 1000.0) as u32,
                 mag_ok,
-                gyro_bias_ok
+                gyro_bias_ok,
+                vqf.is_rest_phase(),
+                bias_dps.0,
+                bias_dps.1,
+                bias_dps.2
             );
         }
 
@@ -849,11 +951,18 @@ async fn main(_spawner: Spawner) {
         // 5. Render Real-Time On-Screen Telemetry HUD Text
         {
             let mut hud_str = ArrayString::<128>::new();
+            let rest_tag = if ahrs_backend == AhrsBackend::Vqf && vqf.is_rest_phase() {
+                " REST"
+            } else {
+                ""
+            };
             let _ = write!(
                 hud_str,
-                "MADGWICK AHRS {}{}\nPITCH:{:4}° ROLL:{:4}° YAW:{:4}°\nMODE {}/{}: {}",
+                "{} AHRS {}{}{}\nPITCH:{:4}° ROLL:{:4}° YAW:{:4}°\nMODE {}/{}: {}",
+                ahrs_backend.name(),
                 if mag_ok { "9DoF" } else { "6DoF NOMAG" },
                 if gyro_bias_ok { "" } else { " GYRO?" },
+                rest_tag,
                 pitch_deg,
                 roll_deg,
                 yaw_deg,
@@ -872,7 +981,7 @@ async fn main(_spawner: Spawner) {
             let mut bot_str = ArrayString::<64>::new();
             let _ = write!(
                 bot_str,
-                "B1:MODE B2:ZERO B3:RESET {}FPS",
+                "B1:MODE B2:ZERO B3:RST/HOLD {}FPS",
                 (1.0 / dt_avg) as u32
             );
             let _ = Text::with_baseline(
