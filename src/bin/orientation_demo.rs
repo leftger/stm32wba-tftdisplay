@@ -252,17 +252,26 @@ static SPACECRAFT_VERTICES: [[f32; 3]; 8] = [
     [0.6, 0.0, -2.1],   // 7: Right Thruster
 ];
 
-static SPACECRAFT_FACES: [[usize; 3]; 10] = [
-    [0, 3, 1], // Upper Left Nose
-    [0, 2, 3], // Upper Right Nose
-    [0, 1, 4], // Lower Left Nose
-    [0, 4, 2], // Lower Right Nose
-    [3, 5, 1], // Upper Left Wing Root
-    [3, 2, 5], // Upper Right Wing Root
-    [1, 6, 4], // Lower Left Engine
-    [2, 4, 7], // Lower Right Engine
-    [5, 6, 1], // Tail Stabilizer Left
-    [5, 2, 7], // Tail Stabilizer Right
+static SPACECRAFT_FACES: [[usize; 3]; 20] = [
+    // Front Winding
+    [0, 3, 1], [0, 2, 3], [0, 1, 4], [0, 4, 2],
+    [3, 5, 1], [3, 2, 5], [1, 6, 4], [2, 4, 7],
+    [5, 6, 1], [5, 2, 7],
+    // Back Winding (Double-sided rendering across 360° orientations)
+    [0, 1, 3], [0, 3, 2], [0, 4, 1], [0, 2, 4],
+    [3, 1, 5], [3, 5, 2], [1, 4, 6], [2, 7, 4],
+    [5, 1, 6], [5, 7, 2],
+];
+
+static SPACECRAFT_NORMALS: [[f32; 3]; 8] = [
+    [0.0, 0.0, 1.0],   // 0: Nose Cone
+    [-0.8, 0.0, -0.6], // 1: Left Wing
+    [0.8, 0.0, -0.6],  // 2: Right Wing
+    [0.0, 0.9, -0.4],  // 3: Canopy Top
+    [0.0, -0.9, -0.4], // 4: Fuselage Bottom
+    [0.0, 1.0, -0.2],  // 5: Vertical Tail Stabilizer
+    [-0.5, 0.0, -0.8], // 6: Left Thruster
+    [0.5, 0.0, -0.8],  // 7: Right Thruster
 ];
 
 struct ArrayString<const N: usize> {
@@ -373,7 +382,7 @@ async fn main(_spawner: Spawner) {
         defmt::warn!("IMU initialization failed! Check SPI3 wiring (PA0, PD5, PA1, PA4).");
     }
 
-    let mut madgwick = MadgwickFilter::new(0.08);
+    let mut madgwick = MadgwickFilter::new(0.45);
 
     let mut engine = K3dengine::new(VIEW_WIDTH as u16, VIEW_HEIGHT as u16);
     apply_default_caps(&mut engine);
@@ -386,7 +395,7 @@ async fn main(_spawner: Spawner) {
         colors: &[],
         lines: &[],
         normals: &[],
-        vertex_normals: &[],
+        vertex_normals: &SPACECRAFT_NORMALS,
         uvs: &[],
         texture_id: None,
     };
@@ -463,17 +472,9 @@ async fn main(_spawner: Spawner) {
 
         // 2. Poll IMU & Execute Madgwick AHRS Filter Update
         if imu_ok {
-            match (imu.read_accel(), imu.read_gyro()) {
+            match (imu.read_accelerometer(), imu.read_gyroscope_radians()) {
                 (Ok(accel), Ok(gyro)) => {
-                    let gx_rad = (gyro.x as f32 / 65.5) * (core::f32::consts::PI / 180.0);
-                    let gy_rad = (gyro.y as f32 / 65.5) * (core::f32::consts::PI / 180.0);
-                    let gz_rad = (gyro.z as f32 / 65.5) * (core::f32::consts::PI / 180.0);
-
-                    let ax = accel.x as f32;
-                    let ay = accel.y as f32;
-                    let az = accel.z as f32;
-
-                    madgwick.update_6dof(gx_rad, gy_rad, gz_rad, ax, ay, az, 0.01667);
+                    madgwick.update_6dof(gyro.x, gyro.y, gyro.z, accel.x, accel.y, accel.z, 0.01667);
                 }
                 (Err(_e_a), _) => {
                     if frame_count % 60 == 0 {
