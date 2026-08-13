@@ -38,7 +38,7 @@ use embedded_3dgfx::config::apply_default_caps;
 use embedded_3dgfx::mesh::{Geometry, K3dMesh, RenderMode};
 use embedded_3dgfx::renderer::FrameCtx;
 use embedded_3dgfx::K3dengine;
-use nalgebra::{Point3, UnitQuaternion};
+use nalgebra::Point3;
 
 bind_interrupts!(struct Irqs {
     GPDMA1_CHANNEL0 => InterruptHandler<peripherals::GPDMA1_CH0>;
@@ -328,7 +328,7 @@ async fn main(_spawner: Spawner) {
     let mut display = Builder::new(ILI9341Rgb565, di)
         .reset_pin(rst)
         .color_order(mipidsi::options::ColorOrder::Bgr)
-        .orientation(Orientation::new().rotate(Rotation::Deg90)) // 320x240 Landscape
+        .orientation(Orientation::new().rotate(Rotation::Deg90).flip_horizontal())
         .init(&mut embassy_time::Delay)
         .unwrap();
 
@@ -453,16 +453,28 @@ async fn main(_spawner: Spawner) {
 
         // 2. Poll IMU & Execute Madgwick AHRS Filter Update
         if imu_ok {
-            if let (Ok(accel), Ok(gyro)) = (imu.read_accel(), imu.read_gyro()) {
-                let gx_rad = (gyro.x as f32 / 65.5) * (core::f32::consts::PI / 180.0);
-                let gy_rad = (gyro.y as f32 / 65.5) * (core::f32::consts::PI / 180.0);
-                let gz_rad = (gyro.z as f32 / 65.5) * (core::f32::consts::PI / 180.0);
+            match (imu.read_accel(), imu.read_gyro()) {
+                (Ok(accel), Ok(gyro)) => {
+                    let gx_rad = (gyro.x as f32 / 65.5) * (core::f32::consts::PI / 180.0);
+                    let gy_rad = (gyro.y as f32 / 65.5) * (core::f32::consts::PI / 180.0);
+                    let gz_rad = (gyro.z as f32 / 65.5) * (core::f32::consts::PI / 180.0);
 
-                let ax = accel.x as f32;
-                let ay = accel.y as f32;
-                let az = accel.z as f32;
+                    let ax = accel.x as f32;
+                    let ay = accel.y as f32;
+                    let az = accel.z as f32;
 
-                madgwick.update_6dof(gx_rad, gy_rad, gz_rad, ax, ay, az, 0.01667);
+                    madgwick.update_6dof(gx_rad, gy_rad, gz_rad, ax, ay, az, 0.01667);
+                }
+                (Err(_e_a), _) => {
+                    if frame_count % 60 == 0 {
+                        defmt::warn!("IMU Accel Read Error on SPI3!");
+                    }
+                }
+                (_, Err(_e_g)) => {
+                    if frame_count % 60 == 0 {
+                        defmt::warn!("IMU Gyro Read Error on SPI3!");
+                    }
+                }
             }
         }
 
@@ -477,13 +489,13 @@ async fn main(_spawner: Spawner) {
 
         if frame_count % 60 == 0 {
             defmt::info!(
-                "3D AHRS | Pitch={}° Roll={}° Yaw={}°",
-                pitch_deg, roll_deg, yaw_deg
+                "3D AHRS | Pitch={}° Roll={}° Yaw={}° | imu_ok={}",
+                pitch_deg, roll_deg, yaw_deg, imu_ok
             );
         }
 
-        // 3. Update 3D Object Quaternion Orientation
-        craft_mesh.similarity.isometry.rotation = UnitQuaternion::from_euler_angles(pitch, yaw, roll);
+        // 3. Update 3D Object Transformation Matrix via set_attitude()
+        craft_mesh.set_attitude(roll, pitch, yaw);
 
         // 4. Render 3D Scene to Offscreen Buffer
         let mut offscreen = OffscreenBuffer {
