@@ -38,7 +38,7 @@ use embedded_3dgfx::config::apply_default_caps;
 use embedded_3dgfx::mesh::{Geometry, K3dMesh, RenderMode};
 use embedded_3dgfx::renderer::FrameCtx;
 use embedded_3dgfx::K3dengine;
-use nalgebra::Point3;
+use nalgebra::{Point3, Vector3};
 
 bind_interrupts!(struct Irqs {
     GPDMA1_CHANNEL0 => InterruptHandler<peripherals::GPDMA1_CH0>;
@@ -242,14 +242,14 @@ impl MadgwickFilter {
 // 3D Object Geometry Definitions (Spacecraft Gimbal Object)
 // ----------------------------------------------------------------------------
 static SPACECRAFT_VERTICES: [[f32; 3]; 8] = [
-    [0.0, 0.0, 2.2],    // 0: Nose Cone
-    [-1.5, 0.0, -1.2],  // 1: Left Wing
-    [1.5, 0.0, -1.2],   // 2: Right Wing
-    [0.0, 0.8, -1.0],   // 3: Canopy Top
-    [0.0, -0.6, -1.0],  // 4: Fuselage Bottom
-    [0.0, 1.4, -1.4],   // 5: Vertical Tail Stabilizer
-    [-0.4, 0.0, -1.4],  // 6: Left Thruster
-    [0.4, 0.0, -1.4],   // 7: Right Thruster
+    [0.0, 0.0, 3.3],    // 0: Nose Cone
+    [-2.25, 0.0, -1.8], // 1: Left Wing
+    [2.25, 0.0, -1.8],  // 2: Right Wing
+    [0.0, 1.2, -1.5],   // 3: Canopy Top
+    [0.0, -0.9, -1.5],  // 4: Fuselage Bottom
+    [0.0, 2.1, -2.1],   // 5: Vertical Tail Stabilizer
+    [-0.6, 0.0, -2.1],  // 6: Left Thruster
+    [0.6, 0.0, -2.1],   // 7: Right Thruster
 ];
 
 static SPACECRAFT_FACES: [[usize; 3]; 10] = [
@@ -390,13 +390,23 @@ async fn main(_spawner: Spawner) {
         uvs: &[],
         texture_id: None,
     };
+    let light_dir = Vector3::new(0.5f32, 0.8f32, -0.7f32).normalize();
     let mut craft_mesh = K3dMesh::new(craft_geo);
-    craft_mesh.set_render_mode(RenderMode::Lines);
+    craft_mesh.set_render_mode(RenderMode::GouraudLightDir(light_dir));
     craft_mesh.set_color(Rgb565::CYAN);
 
     let mut commands = CommandBuffer::<512>::new();
 
-    let render_modes = [RenderMode::Lines, RenderMode::Solid, RenderMode::Points];
+    let render_modes = [
+        RenderMode::GouraudLightDir(light_dir),
+        RenderMode::BlinnPhong {
+            light_dir,
+            specular_intensity: 0.6,
+            shininess: 16.0,
+        },
+        RenderMode::SolidLightDir(light_dir),
+        RenderMode::Lines,
+    ];
     let mut render_mode_idx = 0usize;
 
     let mut zero_pitch = 0.0f32;
@@ -494,8 +504,8 @@ async fn main(_spawner: Spawner) {
             );
         }
 
-        // 3. Update 3D Object Transformation Matrix via set_attitude()
-        craft_mesh.set_attitude(roll, pitch, yaw);
+        // 3. Update 3D Object Transformation Matrix (X=Pitch, Y=Yaw, Z=Roll)
+        craft_mesh.set_attitude(pitch, yaw, roll);
 
         // 4. Render 3D Scene to Offscreen Buffer
         let mut offscreen = OffscreenBuffer {
