@@ -11,6 +11,10 @@ path = "src/main.rs"
 name = "doom_demo"
 path = "src/bin/doom_demo.rs"
 
+[[bin]]
+name = "orientation_demo"
+path = "src/bin/orientation_demo.rs"
+
 
 [dependencies]
 embassy-stm32 = { path = "../../embassy-project/embassy/embassy-stm32", features = ["stm32wba65ri", "memory-x", "time-driver-any", "usb-host", "exti"] }

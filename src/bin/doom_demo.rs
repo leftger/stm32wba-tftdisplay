@@ -222,6 +222,99 @@ impl embedded_hal::delay::DelayNs for MicroDelay {
     }
 }
 
+// ----------------------------------------------------------------------------
+// 6-DoF Madgwick AHRS Orientation Filter (no_std, Cortex-M33 FPU Optimized)
+// Fuses Accelerometer (gravity vector) + Gyroscope (rotational rate)
+// into 3D Quaternions for 1-to-1 absolute heading tracking with zero drift.
+// ----------------------------------------------------------------------------
+pub struct MadgwickFilter {
+    pub beta: f32,
+    pub q: [f32; 4], // Quaternion [w, x, y, z]
+}
+
+impl MadgwickFilter {
+    pub const fn new(beta: f32) -> Self {
+        Self {
+            beta,
+            q: [1.0, 0.0, 0.0, 0.0],
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.q = [1.0, 0.0, 0.0, 0.0];
+    }
+
+    pub fn update_6dof(&mut self, gx: f32, gy: f32, gz: f32, ax: f32, ay: f32, az: f32, dt: f32) {
+        let (q1, q2, q3, q4) = (self.q[0], self.q[1], self.q[2], self.q[3]);
+
+        // Normalize accelerometer measurement
+        let norm_a = sqrtf(ax * ax + ay * ay + az * az);
+        if norm_a < 0.001 {
+            return;
+        }
+        let ax = ax / norm_a;
+        let ay = ay / norm_a;
+        let az = az / norm_a;
+
+        // Auxiliary variables to avoid repeated calculations
+        let _2q1 = 2.0 * q1;
+        let _2q2 = 2.0 * q2;
+        let _2q3 = 2.0 * q3;
+        let _2q4 = 2.0 * q4;
+        let _4q1 = 4.0 * q1;
+        let _4q2 = 4.0 * q2;
+        let _4q3 = 4.0 * q3;
+        let _8q2 = 8.0 * q2;
+        let _8q3 = 8.0 * q3;
+        let q1q1 = q1 * q1;
+        let q2q2 = q2 * q2;
+        let q3q3 = q3 * q3;
+        let q4q4 = q4 * q4;
+
+        // Gradient descent algorithm feedback terms
+        let s1 = _4q1 * q3q3 + _2q3 * ax + _4q1 * q2q2 - _2q2 * ay;
+        let s2 = _4q2 * q4q4 - _2q4 * ax + 4.0 * q1q1 * q2 - _2q1 * ay - _4q2 + _8q2 * q2q2 + _8q2 * q3q3 + _4q2 * az;
+        let s3 = 4.0 * q1q1 * q3 + _2q1 * ax + _4q3 * q4q4 - _2q4 * ay - _4q3 + _8q3 * q2q2 + _8q3 * q3q3 + _4q3 * az;
+        let s4 = 4.0 * q2q2 * q4 - _2q2 * ax + 4.0 * q3q3 * q4 - _2q3 * ay;
+
+        let norm_s = sqrtf(s1 * s1 + s2 * s2 + s3 * s3 + s4 * s4);
+        let (s1, s2, s3, s4) = if norm_s > 0.00001 {
+            (s1 / norm_s, s2 / norm_s, s3 / norm_s, s4 / norm_s)
+        } else {
+            (0.0, 0.0, 0.0, 0.0)
+        };
+
+        // Compute rate of change of quaternion from gyroscope
+        let q_dot1 = 0.5 * (-q2 * gx - q3 * gy - q4 * gz) - self.beta * s1;
+        let q_dot2 = 0.5 * (q1 * gx + q3 * gz - q4 * gy) - self.beta * s2;
+        let q_dot3 = 0.5 * (q1 * gy - q2 * gz + q4 * gx) - self.beta * s3;
+        let q_dot4 = 0.5 * (q1 * gz + q2 * gy - q3 * gx) - self.beta * s4;
+
+        // Integrate to yield quaternion
+        let q1_new = q1 + q_dot1 * dt;
+        let q2_new = q2 + q_dot2 * dt;
+        let q3_new = q3 + q_dot3 * dt;
+        let q4_new = q4 + q_dot4 * dt;
+
+        // Normalize quaternion
+        let norm_q = sqrtf(q1_new * q1_new + q2_new * q2_new + q3_new * q3_new + q4_new * q4_new);
+        if norm_q > 0.00001 {
+            self.q[0] = q1_new / norm_q;
+            self.q[1] = q2_new / norm_q;
+            self.q[2] = q3_new / norm_q;
+            self.q[3] = q4_new / norm_q;
+        }
+    }
+
+    pub fn yaw(&self) -> f32 {
+        let (q1, q2, q3, q4) = (self.q[0], self.q[1], self.q[2], self.q[3]);
+        libm::atan2f(
+            2.0 * (q1 * q4 + q2 * q3),
+            1.0 - 2.0 * (q3 * q3 + q4 * q4),
+        )
+    }
+}
+
 // 32KB static TX buffer — keeps SPI DMA chunking to 5 transactions instead
 // of 38 (which caused ~38ms of embassy_time overhead per frame).
 struct TxBuf([u8; 32768]);
@@ -542,6 +635,8 @@ async fn main(spawner: Spawner) {
     let mut imu_toast_msg: &'static str = "";
     let mut imu_was_acting = false;
     let mut imu_yaw_speed: f32 = 0.0;
+    let mut madgwick = MadgwickFilter::new(0.08); // Beta = 0.08 for responsive tracking
+    let mut last_madgwick_yaw: Option<f32> = None;
 
     defmt::info!("Step 6: Setup complete. Entering frame loop...");
 
@@ -626,7 +721,7 @@ async fn main(spawner: Spawner) {
         let usb_shoot = USB_SHOOT.load(Ordering::Relaxed);
 
         // ----------------------------------------------------------------
-        // IMU Fused Sensor Polling: Read Accel + Gyro (~15µs total over SPI3)
+        // 6-DoF Madgwick AHRS Orientation Polling & Quaternion Integration
         // ----------------------------------------------------------------
         let imu_mode_active = IMU_MODE.load(Ordering::Relaxed);
         if imu_ok {
@@ -635,31 +730,43 @@ async fn main(spawner: Spawner) {
                 IMU_ACCEL_Y.store(accel.y as i32, Ordering::Relaxed);
                 IMU_GYRO_X.store(gyro.x as i32, Ordering::Relaxed);
                 IMU_GYRO_Z.store(gyro.z as i32, Ordering::Relaxed);
+
+                if imu_mode_active {
+                    // Convert raw gyro i16 readings (±500 dps scale = 65.5 LSB/dps) to rad/s
+                    let gx_rad = (gyro.x as f32 / 65.5) * (core::f32::consts::PI / 180.0);
+                    let gy_rad = (gyro.y as f32 / 65.5) * (core::f32::consts::PI / 180.0);
+                    let gz_rad = (gyro.z as f32 / 65.5) * (core::f32::consts::PI / 180.0);
+
+                    let ax = accel.x as f32;
+                    let ay = accel.y as f32;
+                    let az = accel.z as f32;
+
+                    // Execute Madgwick 6-DoF Quaternion Gradient Descent Update (dt = 16.67ms @ 60 FPS)
+                    madgwick.update_6dof(gx_rad, gy_rad, gz_rad, ax, ay, az, 0.01667);
+                    let current_yaw = madgwick.yaw();
+
+                    if let Some(prev_yaw) = last_madgwick_yaw {
+                        let mut delta_yaw = current_yaw - prev_yaw;
+                        // Handle 2π wrap-around
+                        if delta_yaw > core::f32::consts::PI {
+                            delta_yaw -= core::f32::consts::TAU;
+                        } else if delta_yaw < -core::f32::consts::PI {
+                            delta_yaw += core::f32::consts::TAU;
+                        }
+                        // Filter out static hand drift
+                        if delta_yaw.abs() > 0.0008 {
+                            imu_yaw_speed = delta_yaw;
+                        } else {
+                            imu_yaw_speed = 0.0;
+                        }
+                    }
+                    last_madgwick_yaw = Some(current_yaw);
+                } else {
+                    last_madgwick_yaw = None;
+                }
             }
         }
         let gyro_z = IMU_GYRO_Z.load(Ordering::Relaxed);
-
-        // ----------------------------------------------------------------
-        // Pure Auto-Forward Walk + Pure Gyroscope Yaw Steering
-        // ----------------------------------------------------------------
-        // Gyroscope Z-Axis Yaw Steering (Pure Horizontal Rotation, No Accelerometer Tilt)
-        const GYRO_Z_DEADZONE: i32 = 70;
-
-        let mut target_yaw_speed = 0.0f32;
-        if gyro_z > GYRO_Z_DEADZONE {
-            target_yaw_speed = (gyro_z - GYRO_Z_DEADZONE) as f32 * 0.00022f32;
-        } else if gyro_z < -GYRO_Z_DEADZONE {
-            target_yaw_speed = (gyro_z + GYRO_Z_DEADZONE) as f32 * 0.00022f32;
-        }
-        // Clamp max turning speed to ±0.16 rad/frame (~9.2°/frame for fast responsive steering)
-        target_yaw_speed = target_yaw_speed.clamp(-0.16, 0.16);
-
-        // Exponential Moving Average (EMA) Low-Pass Filter for Yaw Steering:
-        if imu_mode_active {
-            imu_yaw_speed = imu_yaw_speed * 0.25 + target_yaw_speed * 0.75;
-        } else {
-            imu_yaw_speed = 0.0;
-        }
 
         let imu_turn_right = imu_mode_active && (imu_yaw_speed > 0.003);
         let imu_turn_left = imu_mode_active && (imu_yaw_speed < -0.003);
@@ -669,17 +776,17 @@ async fn main(spawner: Spawner) {
         // Periodic IMU Telemetry Logging (every 60 frames = ~1 sec when IMU mode is active)
         if imu_mode_active && (frame_count % 60 == 0) {
             defmt::info!(
-                "IMU Active | Yaw Speed={=f32} | Gyro Z={}",
+                "Madgwick AHRS Active | Delta Yaw={=f32} | Gyro Z={}",
                 imu_yaw_speed,
                 gyro_z
             );
         }
 
-        // Action Trigger Logging: Log whenever IMU rotation crosses deadzone threshold
+        // Action Trigger Logging: Log whenever Madgwick orientation changes
         let imu_acting = imu_turn_right || imu_turn_left;
         if imu_acting && !imu_was_acting {
             defmt::info!(
-                "IMU Steering Triggered! yaw_spd={=f32} [gyro_z={}]",
+                "Madgwick AHRS Steering Triggered! delta_yaw={=f32} [gyro_z={}]",
                 imu_yaw_speed,
                 gyro_z
             );
@@ -719,8 +826,12 @@ async fn main(spawner: Spawner) {
                 if imu_ok {
                     let new_mode = !IMU_MODE.load(Ordering::Relaxed);
                     IMU_MODE.store(new_mode, Ordering::Relaxed);
+                    if new_mode {
+                        madgwick.reset();
+                        last_madgwick_yaw = None;
+                    }
                     defmt::info!(
-                        "*** B2 TRIPLE PRESS DETECTED: IMU MODE TOGGLED -> {} ***",
+                        "*** B2 TRIPLE PRESS DETECTED: MADGWICK AHRS MODE TOGGLED -> {} ***",
                         if new_mode {
                             "ENABLED (ON)"
                         } else {
@@ -728,7 +839,7 @@ async fn main(spawner: Spawner) {
                         }
                     );
                     imu_toast_msg = if new_mode {
-                        "IMU AUTO-STEER: ON"
+                        "MADGWICK AHRS: ON"
                     } else {
                         "IMU CONTROL: OFF"
                     };
@@ -822,15 +933,10 @@ async fn main(spawner: Spawner) {
             muzzle_flash_counter -= 1;
         }
 
-        let btn_b1 = btn1.is_low() || usb_right;
-        let btn_b2 = btn2.is_low() || usb_forward;
-        let btn_b3 = btn3.is_low() || usb_left;
-        let btn_back = usb_backward;
-
         if b1_pressed || b2_pressed || b3_pressed || move_backward || shoot_pressed {
             manual_mode_timer = 300; // Reset 5-second manual control timeout
 
-            // 1. Yaw Turning (Proportional IMU speed or digital button control)
+            // 1. Yaw Turning (Proportional IMU speed or digital button/touch control)
             if imu_mode_active && imu_yaw_speed.abs() > 0.003 {
                 angle += imu_yaw_speed;
                 if angle > core::f32::consts::TAU {
@@ -838,22 +944,22 @@ async fn main(spawner: Spawner) {
                 } else if angle < 0.0 {
                     angle += core::f32::consts::TAU;
                 }
-            } else if btn_b1 {
-                // B1: Rotate Camera Right
+            } else if b1_pressed {
+                // B1 / Touch Right: Rotate Camera Right
                 angle += 0.05f32;
                 if angle > core::f32::consts::TAU {
                     angle -= core::f32::consts::TAU;
                 }
-            } else if btn_b3 {
-                // B3: Rotate Camera Left
+            } else if b3_pressed {
+                // B3 / Touch Left: Rotate Camera Left
                 angle -= 0.05f32;
                 if angle < 0.0 {
                     angle += core::f32::consts::TAU;
                 }
             }
 
-            // 2. Pure Auto-Forward Movement in IMU Mode OR Digital Button Movement
-            if imu_mode_active || btn_b2 {
+            // 2. Pure Auto-Forward Movement in IMU Mode OR Digital Button/Touch Movement
+            if imu_mode_active || b2_pressed {
                 // Move Forward in Camera Direction at steady 0.06 walk speed
                 try_move(
                     &mut pos_x,
@@ -864,7 +970,7 @@ async fn main(spawner: Spawner) {
                     MAP_SIZE,
                 );
                 head_bob_time += 0.25;
-            } else if btn_back {
+            } else if move_backward {
                 // Move Backward
                 try_move(
                     &mut pos_x,

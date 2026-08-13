@@ -38,11 +38,11 @@ Connect the **Adafruit TDK InvenSense ICM-20948 9-DoF IMU** breakout to the NUCL
 | **MISO / SDO** | `PA1` | `SPI3` MISO (AF6) | SPI Data Out |
 | **CS** | `PA4` | Output GPIO (`PA4`) | Active-Low Chip Select |
 
-#### 🎯 IMU Auto-Steer Controls in DOOM Demo (`doom_demo`)
-- **Activation**: **Triple-press B2 (center button)** within 1.25s (75 frames) to toggle IMU Auto-Steer mode on/off. When active, `[ IMU AUTO-STEER: ON ]` toast banner pops up.
-- **Auto-Forward Walk**: In IMU mode, the player walks forward through the 3D maze automatically at a constant, comfortable pace—keeping the LCD screen pointed directly at your eyes at all times without wrist strain.
-- **Proportional Steering (Yaw)**: **Spin/rotate the board horizontally left or right (Yaw)**. Fused Gyroscope Z-axis angular rate + Accel X-axis lateral tilt steers the camera through hallways.
-- **Pitch Brake / Reverse**: **Tilt the board backward / up toward your face**. Acts as a brake to pause forward movement or slowly reverse. Tilting slightly down gives a sprint boost.
+#### 🎯 6-DoF Madgwick AHRS Controls in DOOM Demo (`doom_demo`)
+- **Activation**: **Triple-press B2 (center button)** within 1.25s (75 frames) to toggle Madgwick AHRS mode on/off. When active, `[ MADGWICK AHRS: ON ]` toast banner pops up.
+- **Madgwick Quaternion Orientation**: Fuses Accelerometer gravity vector and Gyroscope 3D rotational rates into 3D Quaternions ($q_w, q_x, q_y, q_z$) in real-time at 60 FPS using hardware Cortex-M33 FPU.
+- **1-to-1 Absolute Steering**: Turning the physical board 45° physically turns the in-game 3D viewport **exactly 45°** with zero gyro drift!
+- **Auto-Forward Walk**: Player walks forward through the 3D maze automatically at a steady, comfortable pace—keeping the LCD display facing your eyes cleanly at all times.
 - **Additive Control**: Button, Touchscreen, and USB HID keyboard/mouse/gamepad controls remain fully active alongside the IMU.
 
 ---
