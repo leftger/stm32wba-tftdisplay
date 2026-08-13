@@ -660,6 +660,13 @@ async fn main(_spawner: Spawner) {
     craft_mesh.set_render_mode(RenderMode::GouraudLightDir(light_dir));
     craft_mesh.set_color(Rgb565::CYAN);
 
+    // Ink-line pass overlaid on the toon fill. Line primitives are rasterized
+    // straight to the framebuffer with no depth test, so they always land on
+    // top of the shaded triangles.
+    let mut ink_mesh = K3dMesh::new(craft_geo);
+    ink_mesh.set_render_mode(RenderMode::Lines);
+    ink_mesh.set_color(Rgb565::RED);
+
     let mut commands = CommandBuffer::<512>::new();
 
     let render_modes = [
@@ -674,7 +681,9 @@ async fn main(_spawner: Spawner) {
             shininess: 4.0,
         },
         RenderMode::SolidLightDir(light_dir),
-        RenderMode::Toon(light_dir, 3),
+        // Two bands quantizes to three hard tones, which reads as cel shading;
+        // more bands just approximate the flat-lit mode.
+        RenderMode::Toon(light_dir, 2),
         RenderMode::Lines,
     ];
     let mode_names = ["GOURAUD", "BLINN-PHONG", "FLAT", "TOON", "WIREFRAME"];
@@ -814,6 +823,7 @@ async fn main(_spawner: Spawner) {
 
         // 3. Update 3D Object Transformation Matrix (X=Pitch, Y=Yaw, Z=Roll)
         craft_mesh.set_attitude(pitch, yaw, roll);
+        ink_mesh.set_attitude(pitch, yaw, roll);
 
         // 4. Render 3D Scene to Offscreen Buffer
         let mut offscreen = OffscreenBuffer {
@@ -821,7 +831,13 @@ async fn main(_spawner: Spawner) {
             dirty: DirtyRect::empty(),
         };
         commands.clear();
-        if let Ok(()) = engine.record([&craft_mesh].into_iter(), &mut commands, None) {
+        let toon_active = matches!(render_modes[render_mode_idx], RenderMode::Toon(..));
+        let recorded = if toon_active {
+            engine.record([&craft_mesh, &ink_mesh].into_iter(), &mut commands, None)
+        } else {
+            engine.record([&craft_mesh].into_iter(), &mut commands, None)
+        };
+        if let Ok(()) = recorded {
             let mut frame = FrameCtx {
                 zbuffer: zbuf,
                 width: VIEW_WIDTH,
