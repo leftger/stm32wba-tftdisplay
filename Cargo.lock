@@ -727,7 +727,7 @@ dependencies = [
 [[package]]
 name = "embedded-3dgfx"
 version = "0.5.0"
-source = "git+https://github.com/leftger/embedded-3dgfx?branch=feature%2Fslim-features-0.5#d9c4a55d8daae57a5db5741088a7279efccd82b1"
+source = "git+https://github.com/leftger/embedded-3dgfx?branch=master#7dc6c3ae3fc1642b0b2889ae83156a3b84ae41e9"
 dependencies = [
  "critical-section",
  "embedded-draw-target",
