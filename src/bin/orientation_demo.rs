@@ -16,7 +16,7 @@ use embassy_stm32::rcc::*;
 use embassy_stm32::spi::{Config as SpiConfig, Spi};
 use embassy_stm32::time::Hertz;
 use embassy_stm32::Config;
-use embassy_time::{Duration, Ticker};
+use embassy_time::{Duration, Instant, Ticker, Timer};
 use embedded_hal_bus::spi::ExclusiveDevice;
 
 use embedded_graphics::mono_font::{ascii::FONT_6X10, MonoTextStyle};
@@ -30,11 +30,14 @@ use mipidsi::models::ILI9341Rgb565;
 use mipidsi::options::{Orientation, Rotation};
 use mipidsi::Builder;
 
-use icm20948::{AccelConfig, AccelFullScale, GyroConfig, GyroFullScale, Icm20948Driver, SpiInterface as ImuSpiInterface};
+use icm20948::{
+    AccelConfig, AccelFullScale, GyroConfig, GyroFullScale, Icm20948Driver, MagConfig, MagMode,
+    SpiInterface as ImuSpiInterface,
+};
 use libm::{asinf, atan2f, sqrtf};
 
 use embedded_3dgfx::command_buffer::CommandBuffer;
-use embedded_3dgfx::config::apply_default_caps;
+use embedded_3dgfx::config::{apply_default_caps, MaterialProfile};
 use embedded_3dgfx::mesh::{Geometry, K3dMesh, RenderMode};
 use embedded_3dgfx::renderer::FrameCtx;
 use embedded_3dgfx::K3dengine;
@@ -147,7 +150,8 @@ impl<'a> DrawTarget for OffscreenBuffer<'a> {
 }
 
 // ----------------------------------------------------------------------------
-// 6-DoF Madgwick AHRS Orientation Filter (no_std, Cortex-M33 FPU Optimized)
+// 9-DoF Madgwick AHRS Orientation Filter (no_std, Cortex-M33 FPU Optimized)
+// Accel + Gyro + Mag fusion; falls back to 6-DoF IMU update when mag is invalid.
 // ----------------------------------------------------------------------------
 pub struct MadgwickFilter {
     pub beta: f32,
@@ -166,76 +170,249 @@ impl MadgwickFilter {
         self.q = [1.0, 0.0, 0.0, 0.0];
     }
 
+    /// 6-DoF IMU update (accel + gyro). Used as fallback when magnetometer data
+    /// is missing or near-zero.
     pub fn update_6dof(&mut self, gx: f32, gy: f32, gz: f32, ax: f32, ay: f32, az: f32, dt: f32) {
-        let (q1, q2, q3, q4) = (self.q[0], self.q[1], self.q[2], self.q[3]);
+        let (q0, q1, q2, q3) = (self.q[0], self.q[1], self.q[2], self.q[3]);
+
+        let mut q_dot1 = 0.5 * (-q1 * gx - q2 * gy - q3 * gz);
+        let mut q_dot2 = 0.5 * (q0 * gx + q2 * gz - q3 * gy);
+        let mut q_dot3 = 0.5 * (q0 * gy - q1 * gz + q3 * gx);
+        let mut q_dot4 = 0.5 * (q0 * gz + q1 * gy - q2 * gx);
 
         let norm_a = sqrtf(ax * ax + ay * ay + az * az);
-        if norm_a < 0.001 {
+        if norm_a > 0.001 {
+            let ax = ax / norm_a;
+            let ay = ay / norm_a;
+            let az = az / norm_a;
+
+            let _2q0 = 2.0 * q0;
+            let _2q1 = 2.0 * q1;
+            let _2q2 = 2.0 * q2;
+            let _2q3 = 2.0 * q3;
+            let _4q0 = 4.0 * q0;
+            let _4q1 = 4.0 * q1;
+            let _4q2 = 4.0 * q2;
+            let _8q1 = 8.0 * q1;
+            let _8q2 = 8.0 * q2;
+            let q0q0 = q0 * q0;
+            let q1q1 = q1 * q1;
+            let q2q2 = q2 * q2;
+            let q3q3 = q3 * q3;
+
+            let mut s0 = _4q0 * q2q2 + _2q2 * ax + _4q0 * q1q1 - _2q1 * ay;
+            let mut s1 = _4q1 * q3q3 - _2q3 * ax + 4.0 * q0q0 * q1 - _2q0 * ay - _4q1
+                + _8q1 * q1q1
+                + _8q1 * q2q2
+                + _4q1 * az;
+            let mut s2 = 4.0 * q0q0 * q2 + _2q0 * ax + _4q2 * q3q3 - _2q3 * ay - _4q2
+                + _8q2 * q1q1
+                + _8q2 * q2q2
+                + _4q2 * az;
+            let mut s3 = 4.0 * q1q1 * q3 - _2q1 * ax + 4.0 * q2q2 * q3 - _2q2 * ay;
+
+            let norm_s = sqrtf(s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3);
+            if norm_s > 0.00001 {
+                s0 /= norm_s;
+                s1 /= norm_s;
+                s2 /= norm_s;
+                s3 /= norm_s;
+            }
+
+            q_dot1 -= self.beta * s0;
+            q_dot2 -= self.beta * s1;
+            q_dot3 -= self.beta * s2;
+            q_dot4 -= self.beta * s3;
+        }
+
+        self.integrate_quaternion(q_dot1, q_dot2, q_dot3, q_dot4, dt);
+    }
+
+    /// 9-DoF AHRS update (accel + gyro + mag). Falls back to [`Self::update_6dof`]
+    /// when the magnetometer vector is near zero.
+    pub fn update_9dof(
+        &mut self,
+        gx: f32,
+        gy: f32,
+        gz: f32,
+        ax: f32,
+        ay: f32,
+        az: f32,
+        mx: f32,
+        my: f32,
+        mz: f32,
+        dt: f32,
+    ) {
+        if mx.abs() < 1e-6 && my.abs() < 1e-6 && mz.abs() < 1e-6 {
+            self.update_6dof(gx, gy, gz, ax, ay, az, dt);
             return;
         }
-        let ax = ax / norm_a;
-        let ay = ay / norm_a;
-        let az = az / norm_a;
 
-        let _2q1 = 2.0 * q1;
-        let _2q2 = 2.0 * q2;
-        let _2q3 = 2.0 * q3;
-        let _2q4 = 2.0 * q4;
-        let _4q1 = 4.0 * q1;
-        let _4q2 = 4.0 * q2;
-        let _4q3 = 4.0 * q3;
-        let _8q2 = 8.0 * q2;
-        let _8q3 = 8.0 * q3;
-        let q1q1 = q1 * q1;
-        let q2q2 = q2 * q2;
-        let q3q3 = q3 * q3;
-        let q4q4 = q4 * q4;
+        let (q0, q1, q2, q3) = (self.q[0], self.q[1], self.q[2], self.q[3]);
 
-        let s1 = _4q1 * q3q3 + _2q3 * ax + _4q1 * q2q2 - _2q2 * ay;
-        let s2 = _4q2 * q4q4 - _2q4 * ax + 4.0 * q1q1 * q2 - _2q1 * ay - _4q2 + _8q2 * q2q2 + _8q2 * q3q3 + _4q2 * az;
-        let s3 = 4.0 * q1q1 * q3 + _2q1 * ax + _4q3 * q4q4 - _2q4 * ay - _4q3 + _8q3 * q2q2 + _8q3 * q3q3 + _4q3 * az;
-        let s4 = 4.0 * q2q2 * q4 - _2q2 * ax + 4.0 * q3q3 * q4 - _2q3 * ay;
+        let mut q_dot1 = 0.5 * (-q1 * gx - q2 * gy - q3 * gz);
+        let mut q_dot2 = 0.5 * (q0 * gx + q2 * gz - q3 * gy);
+        let mut q_dot3 = 0.5 * (q0 * gy - q1 * gz + q3 * gx);
+        let mut q_dot4 = 0.5 * (q0 * gz + q1 * gy - q2 * gx);
 
-        let norm_s = sqrtf(s1 * s1 + s2 * s2 + s3 * s3 + s4 * s4);
-        let (s1, s2, s3, s4) = if norm_s > 0.00001 {
-            (s1 / norm_s, s2 / norm_s, s3 / norm_s, s4 / norm_s)
-        } else {
-            (0.0, 0.0, 0.0, 0.0)
-        };
+        let norm_a = sqrtf(ax * ax + ay * ay + az * az);
+        if norm_a > 0.001 {
+            let ax = ax / norm_a;
+            let ay = ay / norm_a;
+            let az = az / norm_a;
 
-        let q_dot1 = 0.5 * (-q2 * gx - q3 * gy - q4 * gz) - self.beta * s1;
-        let q_dot2 = 0.5 * (q1 * gx + q3 * gz - q4 * gy) - self.beta * s2;
-        let q_dot3 = 0.5 * (q1 * gy - q2 * gz + q4 * gx) - self.beta * s3;
-        let q_dot4 = 0.5 * (q1 * gz + q2 * gy - q3 * gx) - self.beta * s4;
+            let norm_m = sqrtf(mx * mx + my * my + mz * mz);
+            if norm_m < 0.001 {
+                self.update_6dof(gx, gy, gz, ax, ay, az, dt);
+                return;
+            }
+            let mx = mx / norm_m;
+            let my = my / norm_m;
+            let mz = mz / norm_m;
 
-        let q1_new = q1 + q_dot1 * dt;
-        let q2_new = q2 + q_dot2 * dt;
-        let q3_new = q3 + q_dot3 * dt;
-        let q4_new = q4 + q_dot4 * dt;
+            let _2q0mx = 2.0 * q0 * mx;
+            let _2q0my = 2.0 * q0 * my;
+            let _2q0mz = 2.0 * q0 * mz;
+            let _2q1mx = 2.0 * q1 * mx;
+            let _2q0 = 2.0 * q0;
+            let _2q1 = 2.0 * q1;
+            let _2q2 = 2.0 * q2;
+            let _2q3 = 2.0 * q3;
+            let _2q0q2 = 2.0 * q0 * q2;
+            let _2q2q3 = 2.0 * q2 * q3;
+            let q0q0 = q0 * q0;
+            let q0q1 = q0 * q1;
+            let q0q2 = q0 * q2;
+            let q0q3 = q0 * q3;
+            let q1q1 = q1 * q1;
+            let q1q2 = q1 * q2;
+            let q1q3 = q1 * q3;
+            let q2q2 = q2 * q2;
+            let q2q3 = q2 * q3;
+            let q3q3 = q3 * q3;
 
-        let norm_q = sqrtf(q1_new * q1_new + q2_new * q2_new + q3_new * q3_new + q4_new * q4_new);
+            // Reference direction of Earth's magnetic field
+            let hx = mx * q0q0 - _2q0my * q3 + _2q0mz * q2 + mx * q1q1 + _2q1 * my * q2
+                + _2q1 * mz * q3
+                - mx * q2q2
+                - mx * q3q3;
+            let hy = _2q0mx * q3 + my * q0q0 - _2q0mz * q1 + _2q1mx * q2 - my * q1q1
+                + my * q2q2
+                + _2q2 * mz * q3
+                - my * q3q3;
+            let _2bx = sqrtf(hx * hx + hy * hy);
+            let _2bz = -_2q0mx * q2 + _2q0my * q1 + mz * q0q0 + _2q1mx * q3 - mz * q1q1
+                + _2q2 * mz * q3
+                - mz * q2q2
+                + mz * q3q3;
+            let _4bx = 2.0 * _2bx;
+            let _4bz = 2.0 * _2bz;
+
+            // Gradient descent corrective step (accel + mag objective)
+            let mut s0 = -_2q2 * (2.0 * q1q3 - _2q0q2 - ax)
+                + _2q1 * (2.0 * q0q1 + _2q2q3 - ay)
+                - _2bz * q2 * (_2bx * (0.5 - q2q2 - q3q3) + _2bz * (q1q3 - q0q2) - mx)
+                + (-_2bx * q3 + _2bz * q1)
+                    * (_2bx * (q1q2 - q0q3) + _2bz * (q0q1 + q2q3) - my)
+                + _2bx * q2 * (_2bx * (q0q2 + q1q3) + _2bz * (0.5 - q1q1 - q2q2) - mz);
+            let mut s1 = _2q3 * (2.0 * q1q3 - _2q0q2 - ax)
+                + _2q0 * (2.0 * q0q1 + _2q2q3 - ay)
+                - 4.0 * q1 * (1.0 - 2.0 * q1q1 - 2.0 * q2q2 - az)
+                + _2bz * q3 * (_2bx * (0.5 - q2q2 - q3q3) + _2bz * (q1q3 - q0q2) - mx)
+                + (_2bx * q2 + _2bz * q0) * (_2bx * (q1q2 - q0q3) + _2bz * (q0q1 + q2q3) - my)
+                + (_2bx * q3 - _4bz * q1)
+                    * (_2bx * (q0q2 + q1q3) + _2bz * (0.5 - q1q1 - q2q2) - mz);
+            let mut s2 = -_2q0 * (2.0 * q1q3 - _2q0q2 - ax)
+                + _2q3 * (2.0 * q0q1 + _2q2q3 - ay)
+                - 4.0 * q2 * (1.0 - 2.0 * q1q1 - 2.0 * q2q2 - az)
+                + (-_4bx * q2 - _2bz * q0)
+                    * (_2bx * (0.5 - q2q2 - q3q3) + _2bz * (q1q3 - q0q2) - mx)
+                + (_2bx * q1 + _2bz * q3) * (_2bx * (q1q2 - q0q3) + _2bz * (q0q1 + q2q3) - my)
+                + (_2bx * q0 - _4bz * q2)
+                    * (_2bx * (q0q2 + q1q3) + _2bz * (0.5 - q1q1 - q2q2) - mz);
+            let mut s3 = _2q1 * (2.0 * q1q3 - _2q0q2 - ax)
+                + _2q2 * (2.0 * q0q1 + _2q2q3 - ay)
+                + (-_4bx * q3 + _2bz * q1)
+                    * (_2bx * (0.5 - q2q2 - q3q3) + _2bz * (q1q3 - q0q2) - mx)
+                + (-_2bx * q0 + _2bz * q2)
+                    * (_2bx * (q1q2 - q0q3) + _2bz * (q0q1 + q2q3) - my)
+                + _2bx * q1 * (_2bx * (q0q2 + q1q3) + _2bz * (0.5 - q1q1 - q2q2) - mz);
+
+            let norm_s = sqrtf(s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3);
+            if norm_s > 0.00001 {
+                s0 /= norm_s;
+                s1 /= norm_s;
+                s2 /= norm_s;
+                s3 /= norm_s;
+            }
+
+            q_dot1 -= self.beta * s0;
+            q_dot2 -= self.beta * s1;
+            q_dot3 -= self.beta * s2;
+            q_dot4 -= self.beta * s3;
+        }
+
+        self.integrate_quaternion(q_dot1, q_dot2, q_dot3, q_dot4, dt);
+    }
+
+    #[inline]
+    fn integrate_quaternion(
+        &mut self,
+        q_dot1: f32,
+        q_dot2: f32,
+        q_dot3: f32,
+        q_dot4: f32,
+        dt: f32,
+    ) {
+        let q0 = self.q[0] + q_dot1 * dt;
+        let q1 = self.q[1] + q_dot2 * dt;
+        let q2 = self.q[2] + q_dot3 * dt;
+        let q3 = self.q[3] + q_dot4 * dt;
+
+        let norm_q = sqrtf(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
         if norm_q > 0.00001 {
-            self.q[0] = q1_new / norm_q;
-            self.q[1] = q2_new / norm_q;
-            self.q[2] = q3_new / norm_q;
-            self.q[3] = q4_new / norm_q;
+            self.q[0] = q0 / norm_q;
+            self.q[1] = q1 / norm_q;
+            self.q[2] = q2 / norm_q;
+            self.q[3] = q3 / norm_q;
         }
     }
 
-    pub fn euler_angles(&self) -> (f32, f32, f32) {
-        let (w, x, y, z) = (self.q[0], self.q[1], self.q[2], self.q[3]);
-
-        let roll = atan2f(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y));
-        let sin_pitch = 2.0 * (w * y - z * x);
-        let pitch = if sin_pitch.abs() >= 1.0 {
-            if sin_pitch > 0.0 { core::f32::consts::FRAC_PI_2 } else { -core::f32::consts::FRAC_PI_2 }
-        } else {
-            asinf(sin_pitch)
-        };
-        let yaw = atan2f(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z));
-
-        (pitch, roll, yaw)
+    /// Attitude relative to a stored reference quaternion, as (pitch, roll, yaw).
+    /// Composing quaternions keeps the re-zero valid at any attitude; subtracting
+    /// Euler angles independently breaks down near vertical pitch.
+    pub fn relative_euler(&self, reference: [f32; 4]) -> (f32, f32, f32) {
+        let inv_ref = [reference[0], -reference[1], -reference[2], -reference[3]];
+        euler_from_quat(quat_mul(inv_ref, self.q))
     }
+}
+
+fn quat_mul(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+    [
+        a[0] * b[0] - a[1] * b[1] - a[2] * b[2] - a[3] * b[3],
+        a[0] * b[1] + a[1] * b[0] + a[2] * b[3] - a[3] * b[2],
+        a[0] * b[2] - a[1] * b[3] + a[2] * b[0] + a[3] * b[1],
+        a[0] * b[3] + a[1] * b[2] - a[2] * b[1] + a[3] * b[0],
+    ]
+}
+
+fn euler_from_quat(q: [f32; 4]) -> (f32, f32, f32) {
+    let (w, x, y, z) = (q[0], q[1], q[2], q[3]);
+
+    let roll = atan2f(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y));
+    let sin_pitch = 2.0 * (w * y - z * x);
+    let pitch = if sin_pitch.abs() >= 1.0 {
+        if sin_pitch > 0.0 {
+            core::f32::consts::FRAC_PI_2
+        } else {
+            -core::f32::consts::FRAC_PI_2
+        }
+    } else {
+        asinf(sin_pitch)
+    };
+    let yaw = atan2f(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z));
+
+    (pitch, roll, yaw)
 }
 
 // ----------------------------------------------------------------------------
@@ -252,7 +429,9 @@ static SPACECRAFT_VERTICES: [[f32; 3]; 8] = [
     [0.6, 0.0, -2.1],   // 7: Right Thruster
 ];
 
-static SPACECRAFT_FACES: [[usize; 3]; 20] = [
+const SPACECRAFT_FACE_COUNT: usize = 20;
+
+static SPACECRAFT_FACES: [[usize; 3]; SPACECRAFT_FACE_COUNT] = [
     // Front Winding
     [0, 3, 1], [0, 2, 3], [0, 1, 4], [0, 4, 2],
     [3, 5, 1], [3, 2, 5], [1, 6, 4], [2, 4, 7],
@@ -273,6 +452,24 @@ static SPACECRAFT_NORMALS: [[f32; 3]; 8] = [
     [-0.5, 0.0, -0.8], // 6: Left Thruster
     [0.5, 0.0, -0.8],  // 7: Right Thruster
 ];
+
+/// Face normals follow the triangle winding, so the reversed duplicate of each
+/// face gets the opposite normal and exactly one of the pair survives backface
+/// culling at any orientation.
+fn compute_face_normals(vertices: &[[f32; 3]], faces: &[[usize; 3]], out: &mut [[f32; 3]]) {
+    for (normal, face) in out.iter_mut().zip(faces) {
+        let v0 = Vector3::from(vertices[face[0]]);
+        let v1 = Vector3::from(vertices[face[1]]);
+        let v2 = Vector3::from(vertices[face[2]]);
+        let n = (v1 - v0).cross(&(v2 - v0));
+        let len = n.norm();
+        *normal = if len > 1e-6 {
+            [n.x / len, n.y / len, n.z / len]
+        } else {
+            [0.0, 0.0, 1.0]
+        };
+    }
+}
 
 struct ArrayString<const N: usize> {
     buf: [u8; N],
@@ -319,8 +516,8 @@ async fn main(_spawner: Spawner) {
     let p = embassy_stm32::init(config);
 
     defmt::info!("============================================");
-    defmt::info!("3D Madgwick AHRS Orientation Sync Demo");
-    defmt::info!("100MHz Cortex-M33 + Hardware FPU + 6-DoF AHRS");
+    defmt::info!("3D Madgwick 9-DoF AHRS Orientation Sync Demo");
+    defmt::info!("100MHz Cortex-M33 + Hardware FPU + Accel/Gyro/Mag");
     defmt::info!("============================================");
 
     let mut display_spi_config = SpiConfig::default();
@@ -368,33 +565,92 @@ async fn main(_spawner: Spawner) {
             full_scale: AccelFullScale::G2,
             ..AccelConfig::default()
         };
-        imu.configure_accelerometer(accel_cfg).map_err(|_| "configure_accelerometer() failed")?;
+        imu.configure_accelerometer(accel_cfg)
+            .map_err(|_| "configure_accelerometer() failed")?;
         let gyro_cfg = GyroConfig {
             full_scale: GyroFullScale::Dps500,
             ..GyroConfig::default()
         };
-        imu.configure_gyroscope(gyro_cfg).map_err(|_| "configure_gyroscope() failed")?;
-        defmt::info!("IMU: ICM-20948 initialized successfully (SPI3)");
+        imu.configure_gyroscope(gyro_cfg)
+            .map_err(|_| "configure_gyroscope() failed")?;
+        defmt::info!("IMU: ICM-20948 accel/gyro initialized (SPI3)");
         Ok(())
-    })().is_ok();
+    })()
+    .is_ok();
 
     if !imu_ok {
         defmt::warn!("IMU initialization failed! Check SPI3 wiring (PA0, PD5, PA1, PA4).");
     }
 
-    let mut madgwick = MadgwickFilter::new(0.45);
+    // AK09916 magnetometer over the ICM-20948 I2C master. Keep mag optional so
+    // a failed mag bring-up still leaves 6-DoF AHRS available.
+    let mag_ok = if imu_ok {
+        let mag_cfg = MagConfig {
+            mode: MagMode::Continuous100Hz,
+        };
+        match imu.init_magnetometer(mag_cfg, &mut embassy_time::Delay) {
+            Ok(()) => {
+                defmt::info!("IMU: AK09916 magnetometer initialized (100 Hz)");
+                true
+            }
+            Err(_) => {
+                defmt::warn!("Magnetometer init failed; falling back to 6-DoF Madgwick");
+                false
+            }
+        }
+    } else {
+        false
+    };
+
+    // Gyro zero-rate offset is the dominant drift source: the accelerometer only
+    // constrains roll/pitch, so any uncorrected bias on Z integrates into yaw
+    // forever. Calibrate after mag bring-up, since init_magnetometer() touches
+    // the gyro to clock the I2C master.
+    let gyro_bias_ok = if imu_ok {
+        Timer::after(Duration::from_millis(300)).await; // let the gyro settle
+        let cal = imu
+            .calibrate_gyroscope(512)
+            .or_else(|_| imu.calibrate_gyroscope_with_threshold(512, 10));
+        match cal {
+            Ok(c) => {
+                defmt::info!(
+                    "Gyro bias calibrated: X={} Y={} Z={} LSB",
+                    c.offset_x,
+                    c.offset_y,
+                    c.offset_z
+                );
+                true
+            }
+            Err(_) => {
+                defmt::warn!("Gyro bias calibration failed (board must be still at boot!)");
+                false
+            }
+        }
+    } else {
+        false
+    };
+
+    // Madgwick's reference beta is ~0.033-0.1. Higher values chase accelerometer
+    // spikes, which during hand motion are linear acceleration, not gravity.
+    let mut madgwick = MadgwickFilter::new(0.1);
+    let mut zero_ref = [1.0f32, 0.0, 0.0, 0.0];
 
     let mut engine = K3dengine::new(VIEW_WIDTH as u16, VIEW_HEIGHT as u16);
     apply_default_caps(&mut engine);
+    // The default Lambert profile collapses Blinn-Phong down to SolidLightDir.
+    engine.set_material_profile(MaterialProfile::SimpleSpecular);
     engine.camera.set_position(Point3::new(0.0, 0.5, 6.0));
     engine.camera.set_target(Point3::new(0.0, 0.0, 0.0));
+
+    let mut face_normals = [[0.0f32; 3]; SPACECRAFT_FACE_COUNT];
+    compute_face_normals(&SPACECRAFT_VERTICES, &SPACECRAFT_FACES, &mut face_normals);
 
     let craft_geo = Geometry {
         vertices: &SPACECRAFT_VERTICES,
         faces: &SPACECRAFT_FACES,
         colors: &[],
         lines: &[],
-        normals: &[],
+        normals: &face_normals,
         vertex_normals: &SPACECRAFT_NORMALS,
         uvs: &[],
         texture_id: None,
@@ -408,29 +664,36 @@ async fn main(_spawner: Spawner) {
 
     let render_modes = [
         RenderMode::GouraudLightDir(light_dir),
+        // Specular is added as white to all three channels, but cyan already
+        // saturates green and blue, so only red has headroom. A low shininess
+        // widens the highlight enough to read as a sheen instead of a rare
+        // single-face flash that looks identical to SolidLightDir.
         RenderMode::BlinnPhong {
             light_dir,
-            specular_intensity: 0.6,
-            shininess: 16.0,
+            specular_intensity: 1.0,
+            shininess: 4.0,
         },
         RenderMode::SolidLightDir(light_dir),
+        RenderMode::Toon(light_dir, 3),
         RenderMode::Lines,
     ];
+    let mode_names = ["GOURAUD", "BLINN-PHONG", "FLAT", "TOON", "WIREFRAME"];
     let mut render_mode_idx = 0usize;
-
-    let mut zero_pitch = 0.0f32;
-    let mut zero_roll = 0.0f32;
-    let mut zero_yaw = 0.0f32;
 
     let mut b1_was_pressed = false;
     let mut b2_was_pressed = false;
     let mut b3_was_pressed = false;
+    let mut b1_cooldown = 0u8;
 
     let text_style = MonoTextStyle::new(&FONT_6X10, Rgb565::CYAN);
     let val_style = MonoTextStyle::new(&FONT_6X10, Rgb565::YELLOW);
 
     let mut frame_count: u32 = 0;
-    let mut ticker = Ticker::every(Duration::from_millis(16)); // Target 60 FPS
+    // The blocking 320x240x16bpp blit alone is ~49 ms at 25 MHz, so the real loop
+    // rate is well under 60 FPS. dt is measured rather than assumed.
+    let mut last_frame = Instant::now();
+    let mut dt_avg = 0.05f32;
+    let mut ticker = Ticker::every(Duration::from_millis(16));
 
     defmt::info!("Entering 3D Orientation Render Loop...");
 
@@ -443,38 +706,80 @@ async fn main(_spawner: Spawner) {
 
         // 1. Buttons
         let b1_pressed = btn1.is_low();
-        if b1_pressed && !b1_was_pressed {
+        if b1_cooldown > 0 {
+            b1_cooldown -= 1;
+        } else if b1_pressed && !b1_was_pressed {
             render_mode_idx = (render_mode_idx + 1) % render_modes.len();
             craft_mesh.set_render_mode(render_modes[render_mode_idx].clone());
-            defmt::info!("Render Mode changed to {:?}", render_mode_idx);
+            // Contact bounce sampled at 60 Hz can otherwise advance twice and
+            // make a mode look like it is missing from the cycle.
+            b1_cooldown = 6;
+            defmt::info!(
+                "Render Mode {}: {}",
+                render_mode_idx,
+                mode_names[render_mode_idx]
+            );
         }
         b1_was_pressed = b1_pressed;
 
         let b2_pressed = btn2.is_low();
         if b2_pressed && !b2_was_pressed {
-            let (p, r, y) = madgwick.euler_angles();
-            zero_pitch = p;
-            zero_roll = r;
-            zero_yaw = y;
-            defmt::info!("Zero calibrated: P={=f32} R={=f32} Y={=f32}", p, r, y);
+            zero_ref = madgwick.q;
+            defmt::info!("Attitude re-zeroed to current orientation");
         }
         b2_was_pressed = b2_pressed;
 
         let b3_pressed = btn3.is_low();
         if b3_pressed && !b3_was_pressed {
             madgwick.reset();
-            zero_pitch = 0.0;
-            zero_roll = 0.0;
-            zero_yaw = 0.0;
+            zero_ref = [1.0, 0.0, 0.0, 0.0];
             defmt::info!("Madgwick filter reset");
         }
         b3_was_pressed = b3_pressed;
 
         // 2. Poll IMU & Execute Madgwick AHRS Filter Update
+        let now = Instant::now();
+        // Clamped so a startup stall or one-off hitch can't feed a huge step
+        // into the integrator.
+        let dt = ((now - last_frame).as_micros() as f32 / 1_000_000.0).clamp(0.002, 0.1);
+        last_frame = now;
+        dt_avg = dt_avg * 0.9 + dt * 0.1;
+
         if imu_ok {
             match (imu.read_accelerometer(), imu.read_gyroscope_radians()) {
                 (Ok(accel), Ok(gyro)) => {
-                    madgwick.update_6dof(gyro.x, gyro.y, gyro.z, accel.x, accel.y, accel.z, 0.01667);
+                    if mag_ok {
+                        match imu.read_magnetometer() {
+                            Ok(mag) => {
+                                // AK09916 axes are remapped to the ICM-20948
+                                // accel/gyro body frame (Y/Z inverted).
+                                madgwick.update_9dof(
+                                    gyro.x,
+                                    gyro.y,
+                                    gyro.z,
+                                    accel.x,
+                                    accel.y,
+                                    accel.z,
+                                    mag.x,
+                                    -mag.y,
+                                    -mag.z,
+                                    dt,
+                                );
+                            }
+                            Err(_) => {
+                                madgwick.update_6dof(
+                                    gyro.x, gyro.y, gyro.z, accel.x, accel.y, accel.z, dt,
+                                );
+                                if frame_count % 60 == 0 {
+                                    defmt::warn!("IMU Mag Read Error; using 6-DoF fallback");
+                                }
+                            }
+                        }
+                    } else {
+                        madgwick.update_6dof(
+                            gyro.x, gyro.y, gyro.z, accel.x, accel.y, accel.z, dt,
+                        );
+                    }
                 }
                 (Err(_e_a), _) => {
                     if frame_count % 60 == 0 {
@@ -489,10 +794,7 @@ async fn main(_spawner: Spawner) {
             }
         }
 
-        let (raw_pitch, raw_roll, raw_yaw) = madgwick.euler_angles();
-        let pitch = raw_pitch - zero_pitch;
-        let roll = raw_roll - zero_roll;
-        let yaw = raw_yaw - zero_yaw;
+        let (pitch, roll, yaw) = madgwick.relative_euler(zero_ref);
 
         let pitch_deg = (pitch * (180.0 / core::f32::consts::PI)) as i32;
         let roll_deg = (roll * (180.0 / core::f32::consts::PI)) as i32;
@@ -500,8 +802,13 @@ async fn main(_spawner: Spawner) {
 
         if frame_count % 60 == 0 {
             defmt::info!(
-                "3D AHRS | Pitch={}° Roll={}° Yaw={}° | imu_ok={}",
-                pitch_deg, roll_deg, yaw_deg, imu_ok
+                "AHRS | Pitch={}° Roll={}° Yaw={}° | dt={}ms mag={} gyro_bias={}",
+                pitch_deg,
+                roll_deg,
+                yaw_deg,
+                (dt_avg * 1000.0) as u32,
+                mag_ok,
+                gyro_bias_ok
             );
         }
 
@@ -528,8 +835,15 @@ async fn main(_spawner: Spawner) {
             let mut hud_str = ArrayString::<128>::new();
             let _ = write!(
                 hud_str,
-                "MADGWICK 3D AHRS\nPITCH:{:4}° ROLL:{:4}° YAW:{:4}°",
-                pitch_deg, roll_deg, yaw_deg
+                "MADGWICK AHRS {}{}\nPITCH:{:4}° ROLL:{:4}° YAW:{:4}°\nMODE {}/{}: {}",
+                if mag_ok { "9DoF" } else { "6DoF NOMAG" },
+                if gyro_bias_ok { "" } else { " GYRO?" },
+                pitch_deg,
+                roll_deg,
+                yaw_deg,
+                render_mode_idx + 1,
+                render_modes.len(),
+                mode_names[render_mode_idx]
             );
             let _ = Text::with_baseline(
                 hud_str.as_str(),
@@ -540,7 +854,11 @@ async fn main(_spawner: Spawner) {
             .draw(&mut offscreen);
 
             let mut bot_str = ArrayString::<64>::new();
-            let _ = write!(bot_str, "B1:MODE B2:CALIB B3:RESET");
+            let _ = write!(
+                bot_str,
+                "B1:MODE B2:ZERO B3:RESET {}FPS",
+                (1.0 / dt_avg) as u32
+            );
             let _ = Text::with_baseline(
                 bot_str.as_str(),
                 Point::new(8, 222),
