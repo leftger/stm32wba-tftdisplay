@@ -33,15 +33,16 @@ Connect the **Adafruit TDK InvenSense ICM-20948 9-DoF IMU** breakout to the NUCL
 | :--- | :--- | :--- | :--- |
 | **VIN** | `3.3V` / `5V` | Power Supply | Adafruit board has onboard regulator |
 | **GND** | `GND` | Ground | Common Ground |
-| **SCK / SCL** | `PA0` | `SPI3` SCK (AF6) | 7 MHz SPI Clock |
-| **MOSI / SDA** | `PB8` | `SPI3` MOSI (AF6) | SPI Data In |
+| **SCK / SCL** | `PA0` | `SPI3` SCK (AF6) | 1 MHz SPI Init Clock |
+| **MOSI / SDA** | `PD5` | `SPI3` MOSI (AF5) | SPI Data In (Replaces PB8 to avoid LED3 loading conflict) |
 | **MISO / SDO** | `PA1` | `SPI3` MISO (AF6) | SPI Data Out |
 | **CS** | `PA4` | Output GPIO (`PA4`) | Active-Low Chip Select |
 
-#### 🎯 IMU Controls in DOOM Demo (`doom_demo`)
-- **Activation**: **Triple-press B2 (center button)** within 750ms to toggle IMU motion control mode on/off. When active, `IMU ON` is displayed in green in the HUD MODE section.
-- **Turning (Yaw)**: **Spin/rotate the board horizontally left or right (Yaw)**. Fused Gyroscope Z-axis angular rate + Accel X-axis lateral tilt turns the 3D viewport left and right.
-- **Forward / Backward (Pitch)**: **Tilt the board forward or backward (Pitch)**. Fused Accelerometer Y-axis pitch angle + Gyroscope X-axis pitch rate moves the player forward and backward.
+#### 🎯 IMU Auto-Steer Controls in DOOM Demo (`doom_demo`)
+- **Activation**: **Triple-press B2 (center button)** within 1.25s (75 frames) to toggle IMU Auto-Steer mode on/off. When active, `[ IMU AUTO-STEER: ON ]` toast banner pops up.
+- **Auto-Forward Walk**: In IMU mode, the player walks forward through the 3D maze automatically at a constant, comfortable pace—keeping the LCD screen pointed directly at your eyes at all times without wrist strain.
+- **Proportional Steering (Yaw)**: **Spin/rotate the board horizontally left or right (Yaw)**. Fused Gyroscope Z-axis angular rate + Accel X-axis lateral tilt steers the camera through hallways.
+- **Pitch Brake / Reverse**: **Tilt the board backward / up toward your face**. Acts as a brake to pause forward movement or slowly reverse. Tilting slightly down gives a sprint boost.
 - **Additive Control**: Button, Touchscreen, and USB HID keyboard/mouse/gamepad controls remain fully active alongside the IMU.
 
 ---

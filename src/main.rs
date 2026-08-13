@@ -23,8 +23,8 @@ use embedded_hal_bus::spi::ExclusiveDevice;
 
 use embedded_graphics::mono_font::{ascii::FONT_6X10, MonoTextStyle};
 use embedded_graphics::pixelcolor::Rgb565;
-use embedded_graphics::primitives::Rectangle;
 use embedded_graphics::prelude::*;
+use embedded_graphics::primitives::Rectangle;
 use embedded_graphics::text::{Baseline, Text};
 
 use mipidsi::interface::SpiInterface;
@@ -54,7 +54,8 @@ const VIEW_PIXELS: usize = VIEW_WIDTH * VIEW_HEIGHT;
 struct FrameBuffer([Rgb565; VIEW_PIXELS]);
 struct SafeFrameBuf(UnsafeCell<FrameBuffer>);
 unsafe impl Sync for SafeFrameBuf {}
-static RAW_FRAMEBUF: SafeFrameBuf = SafeFrameBuf(UnsafeCell::new(FrameBuffer([Rgb565::BLACK; VIEW_PIXELS])));
+static RAW_FRAMEBUF: SafeFrameBuf =
+    SafeFrameBuf(UnsafeCell::new(FrameBuffer([Rgb565::BLACK; VIEW_PIXELS])));
 
 struct ZBuffer([u16; VIEW_PIXELS]);
 struct SafeZBuf(UnsafeCell<ZBuffer>);
@@ -85,33 +86,64 @@ impl DirtyRect {
 
     #[inline(always)]
     fn is_valid(&self) -> bool {
-        self.min_x <= self.max_x && self.min_y <= self.max_y && self.min_x < VIEW_WIDTH && self.min_y < VIEW_HEIGHT
+        self.min_x <= self.max_x
+            && self.min_y <= self.max_y
+            && self.min_x < VIEW_WIDTH
+            && self.min_y < VIEW_HEIGHT
     }
 
     #[inline(always)]
     fn add_point(&mut self, x: usize, y: usize) {
-        if x < self.min_x { self.min_x = x; }
-        if y < self.min_y { self.min_y = y; }
-        if x > self.max_x { self.max_x = x; }
-        if y > self.max_y { self.max_y = y; }
+        if x < self.min_x {
+            self.min_x = x;
+        }
+        if y < self.min_y {
+            self.min_y = y;
+        }
+        if x > self.max_x {
+            self.max_x = x;
+        }
+        if y > self.max_y {
+            self.max_y = y;
+        }
     }
 
     #[inline(always)]
     fn merge(&mut self, other: &DirtyRect) {
-        if other.min_x < self.min_x { self.min_x = other.min_x; }
-        if other.min_y < self.min_y { self.min_y = other.min_y; }
-        if other.max_x > self.max_x { self.max_x = other.max_x; }
-        if other.max_y > self.max_y { self.max_y = other.max_y; }
+        if other.min_x < self.min_x {
+            self.min_x = other.min_x;
+        }
+        if other.min_y < self.min_y {
+            self.min_y = other.min_y;
+        }
+        if other.max_x > self.max_x {
+            self.max_x = other.max_x;
+        }
+        if other.max_y > self.max_y {
+            self.max_y = other.max_y;
+        }
     }
 
     #[inline(always)]
     fn sanitize(&mut self) {
-        if self.min_x >= VIEW_WIDTH { self.min_x = VIEW_WIDTH - 1; }
-        if self.min_y >= VIEW_HEIGHT { self.min_y = VIEW_HEIGHT - 1; }
-        if self.max_x >= VIEW_WIDTH { self.max_x = VIEW_WIDTH - 1; }
-        if self.max_y >= VIEW_HEIGHT { self.max_y = VIEW_HEIGHT - 1; }
-        if self.max_x < self.min_x { self.max_x = self.min_x; }
-        if self.max_y < self.min_y { self.max_y = self.min_y; }
+        if self.min_x >= VIEW_WIDTH {
+            self.min_x = VIEW_WIDTH - 1;
+        }
+        if self.min_y >= VIEW_HEIGHT {
+            self.min_y = VIEW_HEIGHT - 1;
+        }
+        if self.max_x >= VIEW_WIDTH {
+            self.max_x = VIEW_WIDTH - 1;
+        }
+        if self.max_y >= VIEW_HEIGHT {
+            self.max_y = VIEW_HEIGHT - 1;
+        }
+        if self.max_x < self.min_x {
+            self.max_x = self.min_x;
+        }
+        if self.max_y < self.min_y {
+            self.max_y = self.min_y;
+        }
     }
 }
 
@@ -136,7 +168,11 @@ impl<'a> DrawTarget for OffscreenBuffer<'a> {
         I: IntoIterator<Item = Pixel<Self::Color>>,
     {
         for Pixel(coord, color) in pixels.into_iter() {
-            if coord.x >= 0 && coord.x < VIEW_WIDTH as i32 && coord.y >= 0 && coord.y < VIEW_HEIGHT as i32 {
+            if coord.x >= 0
+                && coord.x < VIEW_WIDTH as i32
+                && coord.y >= 0
+                && coord.y < VIEW_HEIGHT as i32
+            {
                 let x = coord.x as usize;
                 let y = coord.y as usize;
                 let idx = y * VIEW_WIDTH + x;
@@ -178,7 +214,12 @@ impl<'a> DrawTarget for OffscreenBuffer<'a> {
     #[inline]
     fn clear(&mut self, color: Self::Color) -> Result<(), Self::Error> {
         self.pixels.fill(color);
-        self.dirty = DirtyRect { min_x: 0, min_y: 0, max_x: VIEW_WIDTH - 1, max_y: VIEW_HEIGHT - 1 };
+        self.dirty = DirtyRect {
+            min_x: 0,
+            min_y: 0,
+            max_x: VIEW_WIDTH - 1,
+            max_y: VIEW_HEIGHT - 1,
+        };
         Ok(())
     }
 }
@@ -188,37 +229,49 @@ impl<'a> DrawTarget for OffscreenBuffer<'a> {
 // ----------------------------------------------------------------------------
 
 static CUBE_VERTICES: [[f32; 3]; 8] = [
-    [-1.0, -1.0,  1.0],
-    [ 1.0, -1.0,  1.0],
-    [ 1.0,  1.0,  1.0],
-    [-1.0,  1.0,  1.0],
+    [-1.0, -1.0, 1.0],
+    [1.0, -1.0, 1.0],
+    [1.0, 1.0, 1.0],
+    [-1.0, 1.0, 1.0],
     [-1.0, -1.0, -1.0],
-    [ 1.0, -1.0, -1.0],
-    [ 1.0,  1.0, -1.0],
-    [-1.0,  1.0, -1.0],
+    [1.0, -1.0, -1.0],
+    [1.0, 1.0, -1.0],
+    [-1.0, 1.0, -1.0],
 ];
 
 static CUBE_FACES: [[usize; 3]; 12] = [
-    [0, 1, 2], [0, 2, 3], // Front
-    [5, 4, 7], [5, 7, 6], // Back
-    [3, 2, 6], [3, 6, 7], // Top
-    [4, 5, 1], [4, 1, 0], // Bottom
-    [1, 5, 6], [1, 6, 2], // Right
-    [4, 0, 3], [4, 3, 7], // Left
+    [0, 1, 2],
+    [0, 2, 3], // Front
+    [5, 4, 7],
+    [5, 7, 6], // Back
+    [3, 2, 6],
+    [3, 6, 7], // Top
+    [4, 5, 1],
+    [4, 1, 0], // Bottom
+    [1, 5, 6],
+    [1, 6, 2], // Right
+    [4, 0, 3],
+    [4, 3, 7], // Left
 ];
 
 static OCTA_VERTICES: [[f32; 3]; 6] = [
-    [ 0.0,  1.4,  0.0],
-    [ 1.0,  0.0,  0.0],
-    [ 0.0,  0.0,  1.0],
-    [-1.0,  0.0,  0.0],
-    [ 0.0,  0.0, -1.0],
-    [ 0.0, -1.4,  0.0],
+    [0.0, 1.4, 0.0],
+    [1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0],
+    [-1.0, 0.0, 0.0],
+    [0.0, 0.0, -1.0],
+    [0.0, -1.4, 0.0],
 ];
 
 static OCTA_FACES: [[usize; 3]; 8] = [
-    [0, 1, 2], [0, 2, 3], [0, 3, 4], [0, 4, 1],
-    [5, 2, 1], [5, 3, 2], [5, 4, 3], [5, 1, 4],
+    [0, 1, 2],
+    [0, 2, 3],
+    [0, 3, 4],
+    [0, 4, 1],
+    [5, 2, 1],
+    [5, 3, 2],
+    [5, 4, 3],
+    [5, 1, 4],
 ];
 
 static PALETTE: [Rgb565; 6] = [
@@ -237,7 +290,10 @@ struct ArrayString<const N: usize> {
 
 impl<const N: usize> ArrayString<N> {
     fn new() -> Self {
-        Self { buf: [0; N], len: 0 }
+        Self {
+            buf: [0; N],
+            len: 0,
+        }
     }
     fn as_str(&self) -> &str {
         core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
@@ -326,7 +382,13 @@ async fn main(_spawner: Spawner) {
             pixels: framebuf,
             dirty: DirtyRect::empty(),
         };
-        let _ = Text::with_baseline("STM32WBA65RI FULL 320x240 DEMO", Point::new(10, 5), title_style, Baseline::Top).draw(&mut title_offscreen);
+        let _ = Text::with_baseline(
+            "STM32WBA65RI FULL 320x240 DEMO",
+            Point::new(10, 5),
+            title_style,
+            Baseline::Top,
+        )
+        .draw(&mut title_offscreen);
     }
     let title_rect = Rectangle::new(Point::new(10, 5), Size::new(250, 15));
     let title_pixels = (5..20).flat_map(|y| {
@@ -438,7 +500,8 @@ async fn main(_spawner: Spawner) {
         if prev_combined.is_valid() && prev_combined.min_y <= clear_max_y {
             for y in prev_combined.min_y..=clear_max_y {
                 let row_off = y * VIEW_WIDTH;
-                framebuf[row_off + prev_combined.min_x..=row_off + prev_combined.max_x].fill(bg_color);
+                framebuf[row_off + prev_combined.min_x..=row_off + prev_combined.max_x]
+                    .fill(bg_color);
                 zbuf[row_off + prev_combined.min_x..=row_off + prev_combined.max_x].fill(u16::MAX);
             }
         }
@@ -493,7 +556,11 @@ async fn main(_spawner: Spawner) {
         if should_update_stats {
             let mut stats_str = ArrayString::<64>::new();
             let fps = 1000 / last_total_ms.max(1);
-            let _ = write!(stats_str, "FPS:{} 3D:{}us DMA:{}us", fps, last_render_us, last_blit_us);
+            let _ = write!(
+                stats_str,
+                "FPS:{} 3D:{}us DMA:{}us",
+                fps, last_render_us, last_blit_us
+            );
 
             for y in 220..238 {
                 let row_off = y * VIEW_WIDTH;
@@ -504,7 +571,13 @@ async fn main(_spawner: Spawner) {
                     pixels: framebuf,
                     dirty: DirtyRect::empty(),
                 };
-                let _ = Text::with_baseline(stats_str.as_str(), Point::new(10, 224), stats_style, Baseline::Top).draw(&mut stats_offscreen);
+                let _ = Text::with_baseline(
+                    stats_str.as_str(),
+                    Point::new(10, 224),
+                    stats_style,
+                    Baseline::Top,
+                )
+                .draw(&mut stats_offscreen);
             }
         }
 
@@ -549,8 +622,14 @@ async fn main(_spawner: Spawner) {
         last_blit_us = blit_start.elapsed().as_micros();
 
         last_total_ms = frame_start.elapsed().as_millis();
-        defmt::info!("Frame {}: Total {}ms (3D: {}us, DMA Blit: {}us, FPS: {})", 
-            frame_count, last_total_ms, last_render_us, last_blit_us, 1000 / last_total_ms.max(1));
+        defmt::info!(
+            "Frame {}: Total {}ms (3D: {}us, DMA Blit: {}us, FPS: {})",
+            frame_count,
+            last_total_ms,
+            last_render_us,
+            last_blit_us,
+            1000 / last_total_ms.max(1)
+        );
 
         ticker.next().await;
     }
