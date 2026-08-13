@@ -25,6 +25,9 @@ use embassy_time::{Duration, Instant, Ticker};
 use embedded_hal_bus::spi::ExclusiveDevice;
 use ft6236::FT6236;
 
+use icm20948::{AccelConfig, AccelFullScale, Icm20948Driver, SpiInterface as ImuSpiInterface};
+
+
 use embedded_graphics::mono_font::{ascii::FONT_6X10, MonoTextStyle};
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;
@@ -54,6 +57,16 @@ static USB_BACKWARD: AtomicBool = AtomicBool::new(false);
 static USB_LEFT: AtomicBool = AtomicBool::new(false);
 static USB_RIGHT: AtomicBool = AtomicBool::new(false);
 static USB_SHOOT: AtomicBool = AtomicBool::new(false);
+
+// Fused IMU sensor values
+static IMU_ACCEL_X: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
+static IMU_ACCEL_Y: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
+static IMU_GYRO_X: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
+static IMU_GYRO_Z: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
+
+// Tracks whether IMU control mode is active
+static IMU_MODE: AtomicBool = AtomicBool::new(false);
+
 
 #[embassy_executor::task]
 async fn usb_host_task(
@@ -412,7 +425,7 @@ async fn main(spawner: Spawner) {
     spawner
         .spawn(usb_host_task(p.USB_OTG_HS, p.PD6, p.PD7).expect("Failed to spawn USB host task"));
 
-    defmt::info!("Step 1: Setting up SPI...");
+    defmt::info!("Step 1: Setting up SPI2 (Display, 25 MHz DMA)...");
     let mut spi_config = SpiConfig::default();
     spi_config.frequency = Hertz(25_000_000); // High-speed 25 MHz SPI bus
 
@@ -427,12 +440,12 @@ async fn main(spawner: Spawner) {
         spi_config,
     );
 
-    let cs = Output::new(p.PB9, Level::High, Speed::VeryHigh);
+    let cs_display = Output::new(p.PB9, Level::High, Speed::VeryHigh);
     let dc = Output::new(p.PB11, Level::Low, Speed::VeryHigh);
     let rst = Output::new(p.PA10, Level::High, Speed::VeryHigh);
 
     let tx_buf = unsafe { &mut (*RAW_TX_BUF.0.get()).0 };
-    let spi_device = ExclusiveDevice::new(spi, cs, MicroDelay).unwrap();
+    let spi_device = ExclusiveDevice::new(spi, cs_display, MicroDelay).unwrap();
     let di = SpiInterface::new(spi_device, dc, tx_buf.as_mut_slice());
 
     defmt::info!("Step 2: Initializing ILI9341 Display...");
@@ -460,7 +473,54 @@ async fn main(spawner: Spawner) {
     let touch_int = Input::new(p.PE0, Pull::Up); // T_IRQ (Arduino D2)
     let mut touch_dev = FT6236::new(&mut i2c);
 
-    defmt::info!("Step 5: Setup complete. Entering frame loop...");
+    defmt::info!("Step 5: Initializing ICM-20948 IMU on SPI3 (7 MHz blocking)...");
+    // SPI3: separate peripheral for IMU — no bus sharing complexity needed
+    // Pin mapping (STM32WBA65RI SPI3, AF6):
+    //   SCK  → PA0  (SPI3_SCK,  AF6)
+    //   MOSI → PB8  (SPI3_MOSI, AF6)
+    //   MISO → PA1  (SPI3_MISO, AF6)
+    //   CS   → PA4  (GPIO, active-low, software-controlled)
+    let mut imu_spi_config = SpiConfig::default();
+    imu_spi_config.frequency = Hertz(7_000_000); // ICM-20948 max SPI read rate = 7 MHz
+    let imu_spi = Spi::new_blocking(
+        p.SPI3,
+        p.PA0, // SCK
+        p.PB8, // MOSI
+        p.PA1, // MISO
+        imu_spi_config,
+    );
+    let imu_cs = Output::new(p.PA4, Level::High, Speed::VeryHigh); // ICM-20948 CS
+    let imu_spi_dev = ExclusiveDevice::new(imu_spi, imu_cs, MicroDelay).unwrap();
+    let imu_interface = ImuSpiInterface::new(imu_spi_dev);
+    let mut imu = Icm20948Driver::new(imu_interface);
+    let imu_ok = (|| -> Option<bool> {
+        imu.init(&mut embassy_time::Delay).ok()?;
+        imu.enable_spi_mode().ok()?;
+        let accel_cfg = AccelConfig {
+            full_scale: AccelFullScale::G2, // ±2g gives best tilt resolution
+            ..AccelConfig::default()
+        };
+        imu.configure_accelerometer(accel_cfg).ok()?;
+        use icm20948::{GyroConfig, GyroFullScale};
+        let gyro_cfg = GyroConfig {
+            full_scale: GyroFullScale::Dps500, // ±500 dps for fast yaw/pitch rotation sensitivity
+            ..GyroConfig::default()
+        };
+        imu.configure_gyroscope(gyro_cfg).ok()?;
+        defmt::info!("IMU: ICM-20948 initialized (±2g accel, ±500 dps gyro, SPI3)");
+        Some(true)
+    })().unwrap_or_else(|| {
+        defmt::warn!("IMU: ICM-20948 not found or init failed — IMU mode disabled");
+        false
+    });
+
+    // Triple-press B2 tracking for IMU mode toggle
+    let mut b2_press_count: u8 = 0;
+    let mut b2_press_timer: u32 = 0; // frames since first press in the burst
+    let mut b2_was_pressed = false;
+
+    defmt::info!("Step 6: Setup complete. Entering frame loop...");
+
 
     let mut use_buf_a = true;
 
@@ -542,13 +602,75 @@ async fn main(spawner: Spawner) {
         let usb_right = USB_RIGHT.load(Ordering::Relaxed);
         let usb_shoot = USB_SHOOT.load(Ordering::Relaxed);
 
-        let mut b1_pressed = btn1.is_low() || usb_right; // B1 (Leftmost): Turn Right
-        let mut b2_pressed = btn2.is_low() || usb_forward; // B2 (Center): Move Forward
-        let mut b3_pressed = btn3.is_low() || usb_left; // B3 (Rightmost): Turn Left
-        let mut move_backward = usb_backward;
+        // ----------------------------------------------------------------
+        // IMU Fused Sensor Polling: Read Accel + Gyro (~15µs total over SPI3)
+        // ----------------------------------------------------------------
+        let imu_mode_active = IMU_MODE.load(Ordering::Relaxed);
+        if imu_ok {
+            if let (Ok(accel), Ok(gyro)) = (imu.read_accel(), imu.read_gyro()) {
+                IMU_ACCEL_X.store(accel.x as i32, Ordering::Relaxed);
+                IMU_ACCEL_Y.store(accel.y as i32, Ordering::Relaxed);
+                IMU_GYRO_X.store(gyro.x as i32, Ordering::Relaxed);
+                IMU_GYRO_Z.store(gyro.z as i32, Ordering::Relaxed);
+            }
+        }
+        let accel_x = IMU_ACCEL_X.load(Ordering::Relaxed);
+        let accel_y = IMU_ACCEL_Y.load(Ordering::Relaxed);
+        let gyro_x = IMU_GYRO_X.load(Ordering::Relaxed);
+        let gyro_z = IMU_GYRO_Z.load(Ordering::Relaxed);
+
+        // 1. Yaw Turning (Rotating Left/Right):
+        // Fuse Gyroscope Z-axis (rotational velocity) + Accel X-axis (lateral tilt)
+        const GYRO_Z_DEADZONE: i32 = 120;
+        const ACCEL_X_DEADZONE: i32 = 400;
+
+        let imu_turn_right = imu_mode_active && (gyro_z > GYRO_Z_DEADZONE || accel_x > ACCEL_X_DEADZONE);
+        let imu_turn_left  = imu_mode_active && (gyro_z < -GYRO_Z_DEADZONE || accel_x < -ACCEL_X_DEADZONE);
+
+        // 2. Pitch Movement (Tilting Forward/Backward):
+        // Fuse Accel Y-axis (static pitch tilt) + Gyro X-axis (dynamic pitch rate)
+        // Forward tilt = negative Accel Y / Gyro X
+        let fused_pitch = accel_y + (gyro_x / 8);
+        const PITCH_DEADZONE: i32 = 350;
+
+        let imu_move_fwd  = imu_mode_active && (fused_pitch < -PITCH_DEADZONE);
+        let imu_move_back = imu_mode_active && (fused_pitch > PITCH_DEADZONE);
+
+        let mut b1_pressed = btn1.is_low() || usb_right || imu_turn_right; // Turn Right
+        let mut b2_pressed = btn2.is_low() || usb_forward || imu_move_fwd; // Move Forward
+        let mut b3_pressed = btn3.is_low() || usb_left || imu_turn_left;   // Turn Left
+        let mut move_backward = usb_backward || imu_move_back;
         let mut shoot_pressed = usb_shoot;
 
-        // FT6236 Touch Controller Polling with Hold Debounce & LiftUp Event Handling
+
+        // ----------------------------------------------------------------
+        // Triple-press B2 detection to toggle IMU mode (within 45 frames)
+        // ----------------------------------------------------------------
+        let b2_raw = btn2.is_low();
+        if b2_raw && !b2_was_pressed {
+            // Rising edge of B2
+            if b2_press_timer == 0 {
+                b2_press_timer = 45; // Start 45-frame window
+            }
+            b2_press_count += 1;
+            if b2_press_count >= 3 {
+                // Triple press detected — toggle IMU mode
+                if imu_ok {
+                    let new_mode = !IMU_MODE.load(Ordering::Relaxed);
+                    IMU_MODE.store(new_mode, Ordering::Relaxed);
+                    defmt::info!("IMU mode: {}", if new_mode { "ON" } else { "OFF" });
+                }
+                b2_press_count = 0;
+                b2_press_timer = 0;
+            }
+        }
+        b2_was_pressed = b2_raw;
+        if b2_press_timer > 0 {
+            b2_press_timer -= 1;
+        } else {
+            b2_press_count = 0;
+        }
+
         if touch_int.is_low() || touch_hold_counter > 0 {
             if let Ok(Some(pt)) = touch_dev.get_point0() {
                 if pt.event != ft6236::EventType::LiftUp {
@@ -1212,16 +1334,27 @@ async fn main(spawner: Spawner) {
         }
 
         // C. MODE label — right of face (x=140)
+        // Shows: AUTO / MANUAL and IMU ON/OFF beneath
         {
             let mut fb = FramebufDrawTarget::new(framebuf, VIEW_WIDTH, VIEW_HEIGHT);
             let mode_str = if is_manual { "MANUAL" } else { " AUTO " };
+            let imu_str = if imu_mode_active { "IMU ON" } else { "IMU   " };
             let ty = (HUD_Y + 6) as i32;
             let vy = (HUD_Y + 20) as i32;
+            let iy = (HUD_Y + 36) as i32;
             let _ = Text::with_baseline("MODE", Point::new(140, ty), hud_text_style, Baseline::Top)
                 .draw(&mut fb);
             let _ =
                 Text::with_baseline(mode_str, Point::new(140, vy), hud_val_style, Baseline::Top)
                     .draw(&mut fb);
+            // IMU status line — green when active, dim red when not
+            let imu_style = if imu_mode_active {
+                MonoTextStyle::new(&FONT_6X10, Rgb565::GREEN)
+            } else {
+                MonoTextStyle::new(&FONT_6X10, Rgb565::new(8, 4, 4))
+            };
+            let _ = Text::with_baseline(imu_str, Point::new(140, iy), imu_style, Baseline::Top)
+                .draw(&mut fb);
         }
 
         // D. Minimap — right side of HUD (x=186..234, y=HUD_Y+4..HUD_Y+52)

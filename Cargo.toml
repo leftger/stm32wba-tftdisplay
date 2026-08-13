@@ -26,6 +26,7 @@ panic-probe = { version = "0.3.2", features = ["print-defmt"] }
 
 embedded-hal = "1.0.0"
 embedded-hal-bus = "0.3.0"
+icm20948-rs = "0.2"
 embedded-graphics = "0.8.1"
 embedded-graphics-core = "0.4.0"
 display-interface = "0.5.0"

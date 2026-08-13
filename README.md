@@ -25,6 +25,25 @@ The **DM-TFT28-116** TFT module (ILI9341 controller) connects to the NUCLEO-WBA6
 | **TFT RESET** | D8 | `PA10` | Output GPIO (Reset) |
 | **Power** | 5V / 3.3V & GND | 5V / 3.3V & GND | Power Supply Pins |
 
+### Adafruit ICM-20948 9-DoF IMU Wiring (SPI3 Interface)
+
+Connect the **Adafruit TDK InvenSense ICM-20948 9-DoF IMU** breakout to the NUCLEO-WBA65RI board using the dedicated `SPI3` peripheral:
+
+| IMU Breakout Pin | STM32WBA Pin | Function | Notes |
+| :--- | :--- | :--- | :--- |
+| **VIN** | `3.3V` / `5V` | Power Supply | Adafruit board has onboard regulator |
+| **GND** | `GND` | Ground | Common Ground |
+| **SCK / SCL** | `PA0` | `SPI3` SCK (AF6) | 7 MHz SPI Clock |
+| **MOSI / SDA** | `PB8` | `SPI3` MOSI (AF6) | SPI Data In |
+| **MISO / SDO** | `PA1` | `SPI3` MISO (AF6) | SPI Data Out |
+| **CS** | `PA4` | Output GPIO (`PA4`) | Active-Low Chip Select |
+
+#### 🎯 IMU Controls in DOOM Demo (`doom_demo`)
+- **Activation**: **Triple-press B2 (center button)** within 750ms to toggle IMU motion control mode on/off. When active, `IMU ON` is displayed in green in the HUD MODE section.
+- **Turning (Yaw)**: **Spin/rotate the board horizontally left or right (Yaw)**. Fused Gyroscope Z-axis angular rate + Accel X-axis lateral tilt turns the 3D viewport left and right.
+- **Forward / Backward (Pitch)**: **Tilt the board forward or backward (Pitch)**. Fused Accelerometer Y-axis pitch angle + Gyroscope X-axis pitch rate moves the player forward and backward.
+- **Additive Control**: Button, Touchscreen, and USB HID keyboard/mouse/gamepad controls remain fully active alongside the IMU.
+
 ---
 
 ## 🎨 3D Engine & Features
