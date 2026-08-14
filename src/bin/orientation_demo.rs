@@ -409,12 +409,159 @@ impl AhrsBackend {
     }
 }
 
-/// Nominal sample period baked into the VQF instance. Real frame time varies, so
-/// gyroscope inputs are scaled by `dt / VQF_DT` to keep integration correct
-/// without rebuilding (and wiping) the filter's bias / LPF state each frame.
+/// Fixed sample period baked into the VQF instance. VQF expresses its rest
+/// thresholds, bias clip and low-pass time constants against this period, so the
+/// loop feeds whole steps of this size and carries the remainder. Rescaling the
+/// gyroscope to absorb a variable frame time instead would also scale the values
+/// rest detection and bias estimation compare against.
 const VQF_DT: f32 = 0.05;
+/// Upper bound on catch-up steps so a long stall cannot spin the integrator.
+const MAX_AHRS_SUBSTEPS: u32 = 8;
 /// ~1 s hold at ~20 FPS.
 const B3_LONG_PRESS_FRAMES: u8 = 20;
+/// Same hold length on B2 enters/leaves magnetometer calibration.
+const B2_LONG_PRESS_FRAMES: u8 = 20;
+
+/// Samples required before a calibration attempt is accepted.
+const MAG_CAL_MIN_SAMPLES: u32 = 400;
+/// Each axis must cover at least this fraction of the widest axis span, which
+/// rejects a calibration collected by waving the board around a single axis.
+const MAG_CAL_MIN_SPAN_RATIO: f32 = 0.3;
+/// Relative deviation from the calibrated sphere radius that marks a sample as
+/// magnetically disturbed.
+const MAG_NORM_TOLERANCE: f32 = 0.35;
+
+// ----------------------------------------------------------------------------
+// Magnetometer hard-iron / soft-iron correction
+// ----------------------------------------------------------------------------
+/// Heading is the only axis gravity cannot constrain, so an uncorrected
+/// magnetometer offset feeds straight into yaw drift. Calibration records the
+/// per-axis extremes while the board is rotated through all orientations, then
+/// centers the ellipsoid (hard iron) and equalizes its axes (soft iron).
+#[derive(Clone, Copy)]
+struct MagCal {
+    offset: [f32; 3],
+    scale: [f32; 3],
+    /// Mean corrected field magnitude, used to spot disturbed samples.
+    radius: f32,
+    calibrated: bool,
+    collecting: bool,
+    min: [f32; 3],
+    max: [f32; 3],
+    samples: u32,
+}
+
+impl MagCal {
+    const fn new() -> Self {
+        Self {
+            offset: [0.0; 3],
+            scale: [1.0; 3],
+            radius: 0.0,
+            calibrated: false,
+            collecting: false,
+            min: [0.0; 3],
+            max: [0.0; 3],
+            samples: 0,
+        }
+    }
+
+    fn start(&mut self) {
+        self.collecting = true;
+        self.samples = 0;
+        self.min = [f32::INFINITY; 3];
+        self.max = [f32::NEG_INFINITY; 3];
+    }
+
+    fn feed(&mut self, m: [f32; 3]) {
+        for ((min, max), value) in self
+            .min
+            .iter_mut()
+            .zip(self.max.iter_mut())
+            .zip(m.iter())
+        {
+            *min = min.min(*value);
+            *max = max.max(*value);
+        }
+        self.samples = self.samples.saturating_add(1);
+    }
+
+    /// Spans are compared against each other rather than against an absolute
+    /// field strength so the check does not depend on the driver's units.
+    fn coverage_ok(&self) -> bool {
+        let spans = self.spans();
+        let widest = spans.iter().copied().fold(0.0f32, f32::max);
+        if widest <= 0.0 {
+            return false;
+        }
+        spans.iter().all(|s| *s >= widest * MAG_CAL_MIN_SPAN_RATIO)
+    }
+
+    fn spans(&self) -> [f32; 3] {
+        let mut spans = [0.0f32; 3];
+        for (span, (max, min)) in spans
+            .iter_mut()
+            .zip(self.max.iter().zip(self.min.iter()))
+        {
+            *span = max - min;
+        }
+        spans
+    }
+
+    fn finish(&mut self) -> bool {
+        self.collecting = false;
+        if self.samples < MAG_CAL_MIN_SAMPLES || !self.coverage_ok() {
+            return false;
+        }
+
+        let spans = self.spans();
+        let mut radii = [0.0f32; 3];
+        for ((offset, radius), (max, (min, span))) in self
+            .offset
+            .iter_mut()
+            .zip(radii.iter_mut())
+            .zip(self.max.iter().zip(self.min.iter().zip(spans.iter())))
+        {
+            *offset = (max + min) * 0.5;
+            *radius = span * 0.5;
+        }
+
+        let mean_radius = (radii[0] + radii[1] + radii[2]) / 3.0;
+        for (scale, radius) in self.scale.iter_mut().zip(radii.iter()) {
+            *scale = if *radius > 0.0 {
+                mean_radius / *radius
+            } else {
+                1.0
+            };
+        }
+        self.radius = mean_radius;
+        self.calibrated = true;
+        true
+    }
+
+    fn apply(&self, m: [f32; 3]) -> [f32; 3] {
+        if !self.calibrated {
+            return m;
+        }
+        [
+            (m[0] - self.offset[0]) * self.scale[0],
+            (m[1] - self.offset[1]) * self.scale[1],
+            (m[2] - self.offset[2]) * self.scale[2],
+        ]
+    }
+
+    /// Rejects samples whose magnitude strays from the calibrated field, which
+    /// is what a nearby motor, speaker or steel bracket looks like.
+    fn accept(&self, m: [f32; 3]) -> bool {
+        let norm = sqrtf(m[0] * m[0] + m[1] * m[1] + m[2] * m[2]);
+        if norm <= 0.0 {
+            return false;
+        }
+        if !self.calibrated || self.radius <= 0.0 {
+            return true;
+        }
+        ((norm - self.radius) / self.radius).abs() <= MAG_NORM_TOLERANCE
+    }
+}
 
 fn quat_mul(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
     [
@@ -585,7 +732,10 @@ async fn main(_spawner: Spawner) {
     let btn2 = Input::new(p.PC5, Pull::Up);  // Zero-Point Calibrate
     let btn3 = Input::new(p.PB4, Pull::Up);  // Reset Filter
 
-    cortex_m::asm::delay(1_000_000);
+    // probe-rs resets the MCU but not the IMU: the ICM-20948 stays powered and
+    // may be mid-conversion in SPI-only mode from the previous run. Give its
+    // supplies and any in-flight SPI transaction time to settle before we talk.
+    Timer::after(Duration::from_millis(50)).await;
 
     let mut imu_spi_config = SpiConfig::default();
     imu_spi_config.frequency = Hertz(1_000_000);
@@ -601,25 +751,53 @@ async fn main(_spawner: Spawner) {
     let imu_interface = ImuSpiInterface::new(imu_spi_dev);
     let mut imu = Icm20948Driver::new(imu_interface);
 
-    let imu_ok = (|| -> Result<(), &'static str> {
-        imu.init(&mut embassy_time::Delay).map_err(|_| "imu.init() failed")?;
-        imu.enable_spi_mode().map_err(|_| "imu.enable_spi_mode() failed")?;
-        let accel_cfg = AccelConfig {
-            full_scale: AccelFullScale::G2,
-            ..AccelConfig::default()
-        };
-        imu.configure_accelerometer(accel_cfg)
-            .map_err(|_| "configure_accelerometer() failed")?;
-        let gyro_cfg = GyroConfig {
-            full_scale: GyroFullScale::Dps500,
-            ..GyroConfig::default()
-        };
-        imu.configure_gyroscope(gyro_cfg)
-            .map_err(|_| "configure_gyroscope() failed")?;
-        defmt::info!("IMU: ICM-20948 accel/gyro initialized (SPI3)");
-        Ok(())
-    })()
-    .is_ok();
+    // A warm MCU reset can leave the ICM-20948's SPI slave shifter mid-byte, so
+    // the first read-modify-write in init() would feed garbage back into
+    // PWR_MGMT_1 and time out. Each attempt begins with verify_who_am_i(): its
+    // CS toggle realigns the slave bit counter, and a correct 0xEA read confirms
+    // the bus is sane before reinit() drives DEVICE_RESET.
+    const IMU_INIT_ATTEMPTS: u32 = 8;
+    let mut imu_ok = false;
+    for attempt in 1..=IMU_INIT_ATTEMPTS {
+        let result = (|| -> Result<(), &'static str> {
+            imu.verify_who_am_i()
+                .map_err(|_| "verify_who_am_i() mismatch")?;
+            imu.reinit(&mut embassy_time::Delay)
+                .map_err(|_| "imu.reinit() failed")?;
+            imu.enable_spi_mode()
+                .map_err(|_| "imu.enable_spi_mode() failed")?;
+            let accel_cfg = AccelConfig {
+                full_scale: AccelFullScale::G2,
+                ..AccelConfig::default()
+            };
+            imu.configure_accelerometer(accel_cfg)
+                .map_err(|_| "configure_accelerometer() failed")?;
+            let gyro_cfg = GyroConfig {
+                full_scale: GyroFullScale::Dps500,
+                ..GyroConfig::default()
+            };
+            imu.configure_gyroscope(gyro_cfg)
+                .map_err(|_| "configure_gyroscope() failed")?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                defmt::info!(
+                    "IMU: ICM-20948 accel/gyro initialized (SPI3) on attempt {}",
+                    attempt
+                );
+                imu_ok = true;
+                break;
+            }
+            Err(e) => {
+                defmt::warn!("IMU init attempt {}/{} failed: {}", attempt, IMU_INIT_ATTEMPTS, e);
+                // Let any in-flight conversion finish and the bus idle high
+                // before the next CS toggle resyncs the slave.
+                Timer::after(Duration::from_millis(20)).await;
+            }
+        }
+    }
 
     if !imu_ok {
         defmt::warn!("IMU initialization failed! Check SPI3 wiring (PA0, PD5, PA1, PA4).");
@@ -687,6 +865,10 @@ async fn main(_spawner: Spawner) {
     let mut ahrs_backend = AhrsBackend::Vqf;
     let mut zero_ref = [1.0f32, 0.0, 0.0, 0.0];
     let mut attitude_q = [1.0f32, 0.0, 0.0, 0.0];
+    let mut mag_cal = MagCal::new();
+    let mut mag_rejects: u32 = 0;
+    // Carries the leftover frame time between whole VQF_DT integration steps.
+    let mut ahrs_accum = 0.0f32;
 
     let mut engine = K3dengine::new(VIEW_WIDTH as u16, VIEW_HEIGHT as u16);
     apply_default_caps(&mut engine);
@@ -746,6 +928,8 @@ async fn main(_spawner: Spawner) {
     let mut b2_was_pressed = false;
     let mut b3_was_pressed = false;
     let mut b1_cooldown = 0u8;
+    let mut b2_hold_frames = 0u8;
+    let mut b2_long_handled = false;
     let mut b3_hold_frames = 0u8;
     let mut b3_long_handled = false;
 
@@ -787,9 +971,45 @@ async fn main(_spawner: Spawner) {
         b1_was_pressed = b1_pressed;
 
         let b2_pressed = btn2.is_low();
-        if b2_pressed && !b2_was_pressed {
-            zero_ref = attitude_q;
-            defmt::info!("Attitude re-zeroed to current orientation");
+        if b2_pressed {
+            if b2_hold_frames < u8::MAX {
+                b2_hold_frames += 1;
+            }
+            if !b2_long_handled && b2_hold_frames >= B2_LONG_PRESS_FRAMES {
+                if mag_cal.collecting {
+                    if mag_cal.finish() {
+                        mag_rejects = 0;
+                        defmt::info!(
+                            "Mag calibrated: offset=[{}, {}, {}] scale=[{}, {}, {}] radius={}",
+                            mag_cal.offset[0],
+                            mag_cal.offset[1],
+                            mag_cal.offset[2],
+                            mag_cal.scale[0],
+                            mag_cal.scale[1],
+                            mag_cal.scale[2],
+                            mag_cal.radius
+                        );
+                    } else {
+                        defmt::warn!(
+                            "Mag calibration rejected ({} samples): rotate through all axes",
+                            mag_cal.samples
+                        );
+                    }
+                } else if mag_ok {
+                    mag_cal.start();
+                    defmt::info!("Mag calibration started: rotate board through all orientations");
+                } else {
+                    defmt::warn!("No magnetometer; calibration unavailable");
+                }
+                b2_long_handled = true;
+            }
+        } else if b2_was_pressed {
+            if !b2_long_handled {
+                zero_ref = attitude_q;
+                defmt::info!("Attitude re-zeroed to current orientation");
+            }
+            b2_hold_frames = 0;
+            b2_long_handled = false;
         }
         b2_was_pressed = b2_pressed;
 
@@ -846,16 +1066,34 @@ async fn main(_spawner: Spawner) {
                     };
 
                     // AK09916 axes remapped into the ICM-20948 accel/gyro body frame.
-                    let (mx, my, mz) = mag
-                        .map(|m| (m.x, -m.y, -m.z))
-                        .unwrap_or((0.0, 0.0, 0.0));
+                    let mag_body = mag.map(|m| [m.x, -m.y, -m.z]);
+
+                    // While collecting, samples train the calibration instead of
+                    // steering heading: feeding a known-uncentered field would
+                    // just pull yaw toward the wrong reference.
+                    let mag_use = match mag_body {
+                        Some(raw) if mag_cal.collecting => {
+                            mag_cal.feed(raw);
+                            None
+                        }
+                        Some(raw) => {
+                            let corrected = mag_cal.apply(raw);
+                            if mag_cal.accept(corrected) {
+                                Some(corrected)
+                            } else {
+                                mag_rejects = mag_rejects.saturating_add(1);
+                                None
+                            }
+                        }
+                        None => None,
+                    };
 
                     match ahrs_backend {
                         AhrsBackend::Madgwick => {
-                            if mag.is_some() {
+                            if let Some(m) = mag_use {
                                 madgwick.update_9dof(
-                                    gyro.x, gyro.y, gyro.z, accel.x, accel.y, accel.z, mx, my, mz,
-                                    dt,
+                                    gyro.x, gyro.y, gyro.z, accel.x, accel.y, accel.z, m[0], m[1],
+                                    m[2], dt,
                                 );
                             } else {
                                 madgwick.update_6dof(
@@ -865,16 +1103,25 @@ async fn main(_spawner: Spawner) {
                             attitude_q = madgwick.q;
                         }
                         AhrsBackend::Vqf => {
-                            // Scale gyro so VQF's fixed VQF_DT integration matches
-                            // the real elapsed frame time.
-                            let scale = dt / VQF_DT;
-                            let gyr = Vector3::new(gyro.x * scale, gyro.y * scale, gyro.z * scale);
+                            let gyr = Vector3::new(gyro.x, gyro.y, gyro.z);
                             let acc = Vector3::new(accel.x, accel.y, accel.z);
-                            if mag.is_some() {
-                                let mag_v = Vector3::new(mx, my, mz);
-                                vqf.update(gyr, acc, mag_v);
-                            } else {
-                                vqf.update_imu(gyr, acc);
+                            let mag_v = mag_use.map(|m| Vector3::new(m[0], m[1], m[2]));
+
+                            // Whole VQF_DT steps keep the gyro at its true rate,
+                            // so rest detection and bias clipping stay meaningful.
+                            ahrs_accum += dt;
+                            let mut steps = 0;
+                            while ahrs_accum >= VQF_DT && steps < MAX_AHRS_SUBSTEPS {
+                                ahrs_accum -= VQF_DT;
+                                steps += 1;
+                                let _ = match mag_v {
+                                    Some(m) => vqf.update(gyr, acc, m),
+                                    None => vqf.update_imu(gyr, acc),
+                                };
+                            }
+                            if steps == MAX_AHRS_SUBSTEPS {
+                                // Drop the backlog rather than replaying a stall.
+                                ahrs_accum = 0.0;
                             }
                             attitude_q = quat_from_uf(vqf.orientation());
                         }
@@ -907,13 +1154,15 @@ async fn main(_spawner: Spawner) {
                 bias.z.to_degrees(),
             );
             defmt::info!(
-                "{} | Pitch={}° Roll={}° Yaw={}° | dt={}ms mag={} gyro_bias={} rest={} online_bias=[{}, {}, {}]dps",
+                "{} | Pitch={}° Roll={}° Yaw={}° | dt={}ms mag={} mag_cal={} mag_rejects={} gyro_bias={} rest={} online_bias=[{}, {}, {}]dps",
                 ahrs_backend.name(),
                 pitch_deg,
                 roll_deg,
                 yaw_deg,
                 (dt_avg * 1000.0) as u32,
                 mag_ok,
+                mag_cal.calibrated,
+                mag_rejects,
                 gyro_bias_ok,
                 vqf.is_rest_phase(),
                 bias_dps.0,
@@ -955,11 +1204,21 @@ async fn main(_spawner: Spawner) {
             } else {
                 ""
             };
+            let mag_tag = if !mag_ok {
+                ""
+            } else if mag_cal.collecting {
+                " MCAL.."
+            } else if mag_cal.calibrated {
+                " MCAL"
+            } else {
+                " RAWMAG"
+            };
             let _ = write!(
                 hud_str,
-                "{} AHRS {}{}{}\nPITCH:{:4}° ROLL:{:4}° YAW:{:4}°\nMODE {}/{}: {}",
+                "{} AHRS {}{}{}{}\nPITCH:{:4}° ROLL:{:4}° YAW:{:4}°\nMODE {}/{}: {}",
                 ahrs_backend.name(),
                 if mag_ok { "9DoF" } else { "6DoF NOMAG" },
+                mag_tag,
                 if gyro_bias_ok { "" } else { " GYRO?" },
                 rest_tag,
                 pitch_deg,
@@ -978,11 +1237,19 @@ async fn main(_spawner: Spawner) {
             .draw(&mut offscreen);
 
             let mut bot_str = ArrayString::<64>::new();
-            let _ = write!(
-                bot_str,
-                "B1:MODE B2:ZERO B3:RST/HOLD {}FPS",
-                (1.0 / dt_avg) as u32
-            );
+            if mag_cal.collecting {
+                let _ = write!(
+                    bot_str,
+                    "MAG CAL {}/{} - ROTATE ALL AXES, HOLD B2",
+                    mag_cal.samples, MAG_CAL_MIN_SAMPLES
+                );
+            } else {
+                let _ = write!(
+                    bot_str,
+                    "B1:MODE B2:ZERO/HOLD-CAL B3:RST {}FPS",
+                    (1.0 / dt_avg) as u32
+                );
+            }
             let _ = Text::with_baseline(
                 bot_str.as_str(),
                 Point::new(8, 222),

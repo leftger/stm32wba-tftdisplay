@@ -83,6 +83,11 @@ See **[docs/geometry.md](docs/geometry.md)** for field meanings, winding, double
 ### 3. Madgwick / VQF Orientation Sync Demo (`orientation_demo`)
 - ICM-20948-driven spacecraft mesh with VQF (default) or Madgwick AHRS, lit render-mode cycle, and toon ink overlay.
 - Geometry for this demo follows the face-normal contract in [docs/geometry.md](docs/geometry.md).
+- **Controls**: **B1** cycles render mode, **B2** re-zeros attitude (**hold ~1 s** to start/stop magnetometer calibration), **B3** resets the filter (hold to swap AHRS backend).
+- **Heading drift**: yaw is the one axis gravity cannot constrain, so it depends on magnetometer quality and gyro Z bias.
+  - Hold **B2** for ~1 s, rotate the board through all orientations until the sample counter passes the minimum, then hold **B2** again to apply. The HUD shows `MCAL` once a calibration is active (`RAWMAG` means uncorrected).
+  - Calibration removes hard-iron offset and equalizes soft-iron axis gain; afterwards samples whose field magnitude strays too far are rejected as disturbances (see `mag_rejects` in the defmt log).
+  - Keep the board still for a few seconds now and then so VQF's rest-phase gyro bias estimation can run (`REST` on the HUD, `online_bias` in the log).
 - Flash & Run:
   ```bash
   cargo run --release --bin orientation_demo --features lighting
