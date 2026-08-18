@@ -18,6 +18,11 @@ name = "orientation_demo"
 path = "src/bin/orientation_demo.rs"
 required-features = ["lighting"]
 
+[[bin]]
+name = "studio_agent"
+path = "src/bin/studio_agent.rs"
+required-features = ["studio-agent"]
+
 [features]
 default = []
 # Forwarded embedded-3dgfx 0.5 feature gates (slim engine default is MCU-oriented).
@@ -28,12 +33,16 @@ hud = ["embedded-3dgfx/hud"]
 textured = ["embedded-3dgfx/textured"]
 # Convenience bundle for the Doom raycast demo.
 doom = ["lighting", "textured", "raycast", "hud"]
+# Studio live-display agent: native USB-HS bulk RGB565 receiver (no 3D engine).
+studio-agent = []
 
 [dependencies]
 embassy-stm32 = { git = "https://github.com/embassy-rs/embassy", branch = "main", features = ["stm32wba65ri", "memory-x", "time-driver-any", "usb-host", "exti"] }
 embassy-executor = { git = "https://github.com/embassy-rs/embassy", branch = "main", features = ["platform-cortex-m", "executor-thread", "defmt"] }
 embassy-time = { git = "https://github.com/embassy-rs/embassy", branch = "main", features = ["defmt", "defmt-timestamp-uptime"] }
+embassy-sync = { git = "https://github.com/embassy-rs/embassy", branch = "main", features = ["defmt"] }
 embassy-usb-host = { git = "https://github.com/embassy-rs/embassy", branch = "main", features = ["defmt"] }
+embassy-usb = { git = "https://github.com/embassy-rs/embassy", branch = "main", features = ["defmt"] }
 
 cortex-m = { version = "0.7.7", features = ["critical-section-single-core"] }
 cortex-m-rt = "0.7.5"
@@ -56,6 +65,10 @@ embedded-3dgfx = { git = "https://github.com/leftger/embedded-3dgfx", branch = "
 nalgebra = { version = "0.35", default-features = false, features = ["libm"] }
 libm = "0.2.11"
 uf-ahrs = "0.2.1"
+
+# Studio live-display agent deps
+embedded-gui-live = { path = "../embedded-gui/crates/embedded-gui-live" }
+static_cell = "2"
 
 [build-dependencies]
 cortex-m-rt = "0.7.5"

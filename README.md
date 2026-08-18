@@ -80,6 +80,16 @@ See **[docs/geometry.md](docs/geometry.md)** for field meanings, winding, double
   cargo run --release --bin doom_demo --features doom
   ```
 
+### 4. Embedded GUI Studio Live Display Agent (`studio_agent`)
+- Flash-once base firmware that turns the board into a live remote display for [`embedded-gui-studio`](../embedded-gui/crates/embedded-gui-studio). It enumerates as a **vendor-specific USB-HS bulk device (PD6 = DP, PD7 = DM)** with 512-byte IN/OUT endpoints and paints RGB565 rectangles pushed by Studio straight to the ILI9341 panel — no reflash as the host GUI changes.
+- Wire format and codec: [`embedded-gui-live`](../embedded-gui/crates/embedded-gui-live). Studio renders a screen through the real `embedded-gui` `GuiContext`, diffs it, and streams changed 40x40 tiles. The agent copies decoded tiles into a two-slot queue, byte-swaps RGB565 once, and sends them from a dedicated asynchronous GPDMA SPI task. USB reception therefore overlaps the current panel write and naturally backpressures if SPI gets more than two tiles behind.
+- **Connect the user USB-HS port to the PC** (not the ST-Link connector). ST-Link stays attached for flashing/RTT.
+- Flash & Run:
+  ```bash
+  cargo run --release --bin studio_agent --features studio-agent
+  ```
+- Then in Studio: pick `wba65-live` under **Connect USB**, hit **Connect**, and edit KDL — the panel updates in real time (leave **Live** checked). Press Play to stream active busy-wheel and plotter animation phases at up to 30 FPS using dirty tiles. No `/dev/cu.*` port is created; Studio claims the native bulk interface directly with `nusb`.
+
 ### 3. Madgwick / VQF Orientation Sync Demo (`orientation_demo`)
 - ICM-20948-driven spacecraft mesh with VQF (default) or Madgwick AHRS, lit render-mode cycle, and toon ink overlay.
 - Geometry for this demo follows the face-normal contract in [docs/geometry.md](docs/geometry.md).
@@ -103,6 +113,7 @@ See **[docs/geometry.md](docs/geometry.md)** for field meanings, winding, double
 cargo build --release --bin stm32wba-tftdisplay --features physics
 cargo build --release --bin orientation_demo --features lighting
 cargo build --release --bin doom_demo --features doom
+cargo build --release --bin studio_agent --features studio-agent
 ```
 
 ### Flash with Probe-rs
