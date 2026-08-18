@@ -6,7 +6,9 @@
 //!
 //! Protocol: [`embedded_gui_live`]. The host renders an `embedded-gui` screen to
 //! RGB565, diffs it, and streams changed tiles; this agent decodes them with a
-//! constant-memory [`Decoder`] and paints them.
+//! constant-memory [`Decoder`] and paints them. The FT6236 capacitive panel is
+//! sampled between USB reads and reported back as [`Msg::Touch`], so Studio's
+//! Live Interactive mode can react to on-glass touches.
 
 #![no_std]
 #![no_main]
@@ -15,9 +17,11 @@ use defmt_rtt as _;
 use panic_probe as _;
 
 use embassy_executor::Spawner;
+use embassy_futures::select::{select, Either};
 use embassy_stm32::dma::InterruptHandler;
-use embassy_stm32::gpio::{Level, Output, Speed};
-use embassy_stm32::mode::Async;
+use embassy_stm32::gpio::{Input, Level, Output, Pull, Speed};
+use embassy_stm32::i2c::{Config as I2cConfig, I2c, Master as I2cMaster};
+use embassy_stm32::mode::{Async, Blocking};
 use embassy_stm32::rcc::*;
 use embassy_stm32::spi::{mode::Master, Config as SpiConfig, Spi};
 use embassy_stm32::time::Hertz;
@@ -25,6 +29,7 @@ use embassy_stm32::usb::{self, Driver};
 use embassy_stm32::{bind_interrupts, peripherals, Config};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
+use embassy_time::{Duration, Ticker};
 use embassy_usb::driver::{Endpoint, EndpointIn, EndpointOut};
 use embassy_usb::msos::{
     CompatibleIdFeatureDescriptor, PropertyData, RegistryPropertyFeatureDescriptor,
@@ -32,6 +37,10 @@ use embassy_usb::msos::{
 use embassy_usb::{Builder, UsbDevice};
 use embedded_gui_live::{Decoder, Msg, PROTO_VERSION};
 use static_cell::StaticCell;
+
+#[path = "../ft6236.rs"]
+mod ft6236;
+use ft6236::{EventType, FT6236};
 
 bind_interrupts!(struct Irqs {
     USB_OTG_HS => usb::InterruptHandler<peripherals::USB_OTG_HS>;
@@ -63,8 +72,28 @@ struct RectJob {
 static DISPLAY_QUEUE: Channel<CriticalSectionRawMutex, RectJob, 2> = Channel::new();
 static CLEAR_CHUNK: [u8; MAX_RECT_BYTES] = [0; MAX_RECT_BYTES];
 
+/// How often the FT6236 is polled for a new sample while the USB link is idle.
+const TOUCH_POLL: Duration = Duration::from_millis(15);
+/// Minimum panel-space movement (px) that forces a fresh `Touch` while held, so
+/// a stationary finger doesn't flood the IN endpoint but drags stay smooth.
+const TOUCH_MOVE_EPS: u16 = 3;
+
 type UsbDriver = Driver<'static, peripherals::USB_OTG_HS>;
 type DisplaySpi = Spi<'static, Async, Master>;
+type TouchI2c = I2c<'static, Blocking, I2cMaster>;
+
+/// Maps a raw FT6236 sample into panel framebuffer coordinates.
+///
+/// The panel is initialized landscape (MADCTL `0xE8`: 320x240), while the
+/// FT6236 reports in its native portrait frame (short axis ~240, long axis
+/// ~320). This rotates the portrait sample 90° into the landscape framebuffer.
+/// The two flips below are the axis conventions most likely correct for this
+/// glass; if a bring-up shows touch mirrored, flip the corresponding line.
+fn map_touch(raw_x: u16, raw_y: u16) -> (u16, u16) {
+    let px = raw_y.min(PANEL_W - 1);
+    let py = (PANEL_H - 1).saturating_sub(raw_x.min(PANEL_H - 1));
+    (px, py)
+}
 
 #[embassy_executor::task]
 async fn usb_task(mut device: UsbDevice<'static, UsbDriver>) {
@@ -120,6 +149,16 @@ async fn main(spawner: Spawner) {
     let dc = Output::new(p.PB11, Level::Low, Speed::VeryHigh);
     let rst = Output::new(p.PA10, Level::High, Speed::VeryHigh);
     spawner.spawn(display_task(spi, cs, dc, rst).expect("create display task"));
+
+    // ── FT6236 capacitive touch on I2C1 (SCL=PB2, SDA=PB1, INT=PE0) ──
+    let mut i2c_config = I2cConfig::default();
+    i2c_config.frequency = Hertz(400_000);
+    let i2c: TouchI2c = I2c::new_blocking(p.I2C1, p.PB2, p.PB1, i2c_config);
+    let touch_int = Input::new(p.PE0, Pull::Up);
+    let mut touch = FT6236::new(i2c);
+    if touch.init(ft6236::Config::default()).is_err() {
+        defmt::warn!("studio_agent: FT6236 not detected; touch uplink disabled");
+    }
 
     // ── Vendor-specific USB bulk device on USB-HS (PD6 = DP, PD7 = DM) ──
     // Match Markham: two 512-byte OUT slots provide enough receive buffering.
@@ -182,73 +221,138 @@ async fn main(spawner: Spawner) {
     let dec = DEC.init(Decoder::new());
 
     let mut packet = [0u8; USB_MPS as usize];
+    let mut touch_poll = Ticker::every(TOUCH_POLL);
 
     loop {
         rx.wait_enabled().await;
         defmt::info!("studio_agent: host connected");
+        // Last reported touch, so we only emit on press, release, or a real
+        // move. Reset per connection so a reconnect starts from "no contact".
+        let mut last_touch: Option<(u16, u16)> = None;
 
         loop {
-            let n = match rx.read(&mut packet).await {
-                Ok(n) => n,
-                Err(_) => {
-                    defmt::warn!("studio_agent: endpoint error, awaiting reconnect");
-                    break;
-                }
-            };
-
-            for &b in &packet[..n] {
-                match dec.push(b) {
-                    Ok(true) => match dec.message() {
-                        Ok(Msg::Hello { .. }) => {
-                            let ready = Msg::Ready {
-                                proto: PROTO_VERSION,
-                                fb_w: PANEL_W,
-                                fb_h: PANEL_H,
-                                max_rect_bytes: (DEC_CAP as u32)
-                                    - embedded_gui_live::FRAME_RECT_HEADER as u32,
-                            };
-                            let mut out = [0u8; 32];
-                            if let Ok(len) = ready.encode(&mut out) {
-                                let _ = tx.write_transfer(&out[..len], true).await;
-                            }
+            // Race an inbound USB read against the touch poll tick so the panel
+            // is sampled even while the host is idle (no OUT traffic pending).
+            match select(rx.read(&mut packet), touch_poll.next()).await {
+                Either::First(read) => {
+                    let n = match read {
+                        Ok(n) => n,
+                        Err(_) => {
+                            defmt::warn!("studio_agent: endpoint error, awaiting reconnect");
+                            break;
                         }
-                        Ok(Msg::FrameRect {
-                            x, y, w, h, pixels, ..
-                        }) => {
-                            if pixels.len() <= MAX_RECT_BYTES {
-                                let mut job = RectJob {
-                                    x,
-                                    y,
-                                    w,
-                                    h,
-                                    len: pixels.len(),
-                                    pixels_be: [0; MAX_RECT_BYTES],
-                                };
-                                // The wire format is little-endian RGB565;
-                                // ILI9341 consumes each 16-bit pixel MSB first.
-                                for (src, dst) in pixels
-                                    .chunks_exact(2)
-                                    .zip(job.pixels_be.chunks_exact_mut(2))
-                                {
-                                    dst[0] = src[1];
-                                    dst[1] = src[0];
+                    };
+                    for &b in &packet[..n] {
+                        match dec.push(b) {
+                            Ok(true) => match dec.message() {
+                                Ok(Msg::Hello { .. }) => {
+                                    let ready = Msg::Ready {
+                                        proto: PROTO_VERSION,
+                                        fb_w: PANEL_W,
+                                        fb_h: PANEL_H,
+                                        max_rect_bytes: (DEC_CAP as u32)
+                                            - embedded_gui_live::FRAME_RECT_HEADER as u32,
+                                    };
+                                    let mut out = [0u8; 32];
+                                    if let Ok(len) = ready.encode(&mut out) {
+                                        let _ = tx.write_transfer(&out[..len], true).await;
+                                    }
                                 }
-                                DISPLAY_QUEUE.send(job).await;
-                            }
+                                Ok(Msg::FrameRect {
+                                    x, y, w, h, pixels, ..
+                                }) => {
+                                    if pixels.len() <= MAX_RECT_BYTES {
+                                        let mut job = RectJob {
+                                            x,
+                                            y,
+                                            w,
+                                            h,
+                                            len: pixels.len(),
+                                            pixels_be: [0; MAX_RECT_BYTES],
+                                        };
+                                        // The wire format is little-endian
+                                        // RGB565; ILI9341 wants each pixel MSB
+                                        // first.
+                                        for (src, dst) in pixels
+                                            .chunks_exact(2)
+                                            .zip(job.pixels_be.chunks_exact_mut(2))
+                                        {
+                                            dst[0] = src[1];
+                                            dst[1] = src[0];
+                                        }
+                                        DISPLAY_QUEUE.send(job).await;
+                                    }
+                                }
+                                Ok(Msg::Ping) => {
+                                    let mut out = [0u8; 16];
+                                    if let Ok(len) = Msg::Pong.encode(&mut out) {
+                                        let _ = tx.write_transfer(&out[..len], true).await;
+                                    }
+                                }
+                                _ => {}
+                            },
+                            Ok(false) => {}
+                            Err(_) => { /* framing fault: decoder already resynced */ }
                         }
-                        Ok(Msg::Ping) => {
-                            let mut out = [0u8; 16];
-                            if let Ok(len) = Msg::Pong.encode(&mut out) {
-                                let _ = tx.write_transfer(&out[..len], true).await;
-                            }
+                    }
+                }
+                Either::Second(_) => {
+                    if let Some(msg) = poll_touch(&mut touch, &touch_int, &mut last_touch) {
+                        let mut out = [0u8; 16];
+                        if let Ok(len) = msg.encode(&mut out) {
+                            let _ = tx.write_transfer(&out[..len], true).await;
                         }
-                        _ => {}
-                    },
-                    Ok(false) => {}
-                    Err(_) => { /* framing fault: decoder already resynced */ }
+                    }
                 }
             }
         }
+    }
+}
+
+/// Reads the FT6236 and returns a [`Msg::Touch`] only when the state changes:
+/// a new press, a release, or a move past [`TOUCH_MOVE_EPS`] while held.
+fn poll_touch(
+    touch: &mut FT6236<TouchI2c>,
+    touch_int: &Input<'static>,
+    last: &mut Option<(u16, u16)>,
+) -> Option<Msg<'static>> {
+    // The controller only asserts INT (active low) while a finger is present.
+    if touch_int.is_high() {
+        if let Some((x, y)) = last.take() {
+            return Some(Msg::Touch {
+                x,
+                y,
+                pressed: false,
+            });
+        }
+        return None;
+    }
+
+    match touch.get_point0() {
+        Ok(Some(pt)) if pt.event != EventType::LiftUp => {
+            let (x, y) = map_touch(pt.x, pt.y);
+            let moved = match *last {
+                Some((lx, ly)) => {
+                    x.abs_diff(lx) >= TOUCH_MOVE_EPS || y.abs_diff(ly) >= TOUCH_MOVE_EPS
+                }
+                None => true,
+            };
+            if moved {
+                *last = Some((x, y));
+                Some(Msg::Touch {
+                    x,
+                    y,
+                    pressed: true,
+                })
+            } else {
+                None
+            }
+        }
+        _ => last.take().map(|(x, y)| Msg::Touch {
+            x,
+            y,
+            pressed: false,
+        }),
     }
 }
 
